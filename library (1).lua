@@ -470,6 +470,58 @@ local getGcCached = LPH_NO_VIRTUALIZE(function()
 	return result
 end)
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- НАСТОЯЩЕЕ ЛЕЧЕНИЕ ФРИЗА (heap-bloat под Luraph).
+-- Диагностика (замер #getgc(true) на ОДНОМ сервере): без лоадера ~368k объектов,
+-- с JNKIE-лоадером ~653k. Обфусцированный лоадер держит в куче +285k живых
+-- объектов (пулы констант VM, таблицы байткода, замыкания). getgc(true) тащит
+-- ВСЮ эту кучу в Lua-таблицу, и один проход по ней = фриз. Модули при этом
+-- могут быть даже без обфускации — куча раздута самим лоадером.
+--
+-- Решение: НЕ дампить кучу. filtergc фильтрует в C по ключам и возвращает
+-- ТОЛЬКО совпадения (единицы объектов вместо сотен тысяч). Предикаты ниже
+-- остаются прежними и досматривают маленький результат → поведение то же,
+-- скорость — нативная. Fallback на getGcCached() только для сырого режима /
+-- executor'ов без filtergc.
+-- ═══════════════════════════════════════════════════════════════════════════
+local _hasFiltergc = (type(filtergc) == "function")
+
+-- Узкий скан: таблицы, у которых ЕСТЬ все перечисленные ключи (AND).
+local gcTablesWithKeys = LPH_NO_VIRTUALIZE(function(keys)
+	if _hasFiltergc then
+		local ok, res = pcall(filtergc, "table", { Keys = keys })
+		if ok and type(res) == "table" then return res end
+	end
+	return getGcCached()
+end)
+
+-- Объединение нескольких узких проходов (для предикатов с OR-логикой).
+-- Каждый filtergc-проход нативный и возвращает единицы объектов; их union
+-- всё равно на порядки меньше полного дампа кучи.
+local gcTablesAnyKey = LPH_NO_VIRTUALIZE(function(keyGroups)
+	if not _hasFiltergc then return getGcCached() end
+	local seen, out = {}, {}
+	for gi = 1, #keyGroups do
+		local ok, res = pcall(filtergc, "table", { Keys = keyGroups[gi] })
+		if ok and type(res) == "table" then
+			for i = 1, #res do
+				local v = res[i]
+				if not seen[v] then
+					seen[v] = true
+					out[#out + 1] = v
+				end
+			end
+		end
+	end
+	return out
+end)
+
+-- Ключи-маркеры клиентских таблиц (OR-ветки isLocalGameClient/looksLikeActorClient).
+local CLIENT_KEY_GROUPS = {
+	{ "IsLocalClient" }, { "IsLocalPlayer" }, { "Loadouts" }, { "Player" },
+	{ "Owner" }, { "UID" }, { "ActorUID" }, { "Model" }, { "Rig" }, { "Character" },
+}
+
 local Bridge = {}
 
 local function perfState()
@@ -782,7 +834,7 @@ end
 local findClientsInGC = LPH_NO_VIRTUALIZE(function()
 	if not getgc then return nil, 0 end
 	local best, bestCount = nil, 0
-	for _, v in ipairs(getGcCached()) do
+	for _, v in ipairs(gcTablesWithKeys({ "Clients", "GetClientFromPlayer" })) do
 		if isClientsTable(v) then
 			local n = countClientsTable(v)
 			if n > bestCount then
@@ -929,7 +981,7 @@ local refreshActorClientsFromGC = LPH_NO_VIRTUALIZE(function()
 	end
 	table.clear(State.uidToPlayer)
 	table.clear(State.modelToPlayer)
-	for _, v in ipairs(getGcCached()) do
+	for _, v in ipairs(gcTablesAnyKey(CLIENT_KEY_GROUPS)) do
 		if isLocalGameClient(v) then
 			captureLocalClient(v, "gc-scan")
 		elseif looksLikeActorClient(v) then
@@ -1126,7 +1178,7 @@ local resolveLocalClient = LPH_NO_VIRTUALIZE(function(force)
 	end
 	State.lastLocalClientGc = now
 
-	for _, v in ipairs(getGcCached()) do
+	for _, v in ipairs(gcTablesWithKeys({ "IsLocalClient" })) do
 		if type(v) == "table" and rawget(v, "IsLocalClient") == true then
 			captureLocalClient(v, "gc-IsLocalClient")
 			return v
@@ -1140,7 +1192,7 @@ local resolveLocalClient = LPH_NO_VIRTUALIZE(function(force)
 		if client then return client end
 	end
 
-	for _, v in ipairs(getGcCached()) do
+	for _, v in ipairs(gcTablesAnyKey(CLIENT_KEY_GROUPS)) do
 		if isLocalGameClient(v) then
 			captureLocalClient(v, "getgc-client")
 			return v
@@ -1620,7 +1672,7 @@ Bridge.scanFluxInventoryService = LPH_NO_VIRTUALIZE(function(force)
 	end
 	State.lastFluxScan = now
 	local best, bestScore = nil, 0
-	for _, obj in ipairs(getGcCached()) do
+	for _, obj in ipairs(gcTablesWithKeys({ "Equipped" })) do
 		if type(obj) ~= "table" then continue end
 		local eq = rawget(obj, "Equipped")
 		if type(eq) ~= "table" then continue end
@@ -1663,7 +1715,7 @@ Bridge.scanFluxFireHandlerFromGc = LPH_NO_VIRTUALIZE(function(force)
 	end
 	State.lastFluxGcScan = now
 	local best, bestScore = nil, 0
-	for _, obj in ipairs(getGcCached()) do
+	for _, obj in ipairs(gcTablesWithKeys({ "_discharge" })) do
 		if type(obj) ~= "table" then continue end
 		if type(safeTableGet(obj, "_discharge")) ~= "function" then continue end
 		if type(safeTableGet(obj, "_item")) ~= "table" and type(safeTableGet(obj, "_firearm")) ~= "table" then
@@ -1795,7 +1847,7 @@ Bridge.resolveFluxHandlerByItemUid = LPH_NO_VIRTUALIZE(function(ctx, force)
 	State.lastFluxItemScan = now
 	if type(getgc) ~= "function" then return nil end
 	local found = nil
-	for _, obj in ipairs(getGcCached()) do
+	for _, obj in ipairs(gcTablesWithKeys({ "_discharge" })) do
 		if not Bridge.isFluxShooterHandler(obj) then continue end
 		local item = safeTableGet(obj, "_item")
 		if type(item) ~= "table" then continue end
@@ -2680,7 +2732,7 @@ local function tickRepSyncBatch(batchSize)
 		end
 	end
 
-	-- НОВЫЕ акторы (включая NPC): обрабатываем немедленно, в обход NPC-троттла.
+	-- НОВЫЕ акторы (включая NPC): обрабатываем немедленно, в обход NPC-т��оттла.
 	-- Раньше новый NPC ждал полного прохода очереди (~минута на плотных картах).
 	local napq = State._newActorPriorityQueue
 	if napq and #napq > 0 then
@@ -2865,7 +2917,7 @@ local function refreshActorsForEsp()
 		Bridge.perfEnd("esp.refresh", perfT, "init_batch")
 		return
 	end
-	-- FIX v10: немедл��нный полный скан при обнаружении нового игрока (respawn)
+	-- FIX v10: немедл���нный полный скан при обнаружении нового игрока (respawn)
 	if State.pendingPlayerRescan then
 		State.pendingPlayerRescan = false
 		State.lastEspFullRescan = now
@@ -3705,7 +3757,7 @@ function Bridge.tuneFromHandler(handler)
 	return tableField(handler, "Tune")
 end
 
--- ─────────────────────────────────────────────────────────────────────────
+-- ─────────────────────────────────────────────────���───────────────────────
 -- InventoryService — синглтон Flux (модуль возвращает уже созданный экземпляр).
 -- Flux уничтожает свои ModuleScript'ы после загрузки, но они остаются в nil-
 -- parent, а require-кэш Roblox держит результат — поэтому require() по такому
@@ -4025,7 +4077,7 @@ Bridge.scanInventoryFromGc = LPH_NO_VIRTUALIZE(function(mods)
 	Bridge.perfCount("inventoryGcScan")
 
 	local best, bestScore = nil, 0
-	for _, v in ipairs(getGcCached()) do
+	for _, v in ipairs(gcTablesWithKeys({ "Storages" })) do
 		if type(v) ~= "table" then continue end
 		local score = Bridge.inventoryOwnerScore(v, mods)
 		if score > bestScore then
@@ -5413,7 +5465,7 @@ Bridge.findClientServiceInGC = LPH_NO_VIRTUALIZE(function()
 		return nil
 	end
 	local best, bestScore = nil, 0
-	for _, v in ipairs(getGcCached()) do
+	for _, v in ipairs(gcTablesWithKeys({ "Clients" })) do
 		local score = Bridge.scoreClientService(v)
 		if score > bestScore then
 			best = v
@@ -5522,7 +5574,7 @@ Bridge.findClientTableInGC = LPH_NO_VIRTUALIZE(function(player)
 	if type(negT) == "number" and now - negT < 20.0 then
 		return nil
 	end
-	for _, v in ipairs(getGcCached()) do
+	for _, v in ipairs(gcTablesAnyKey({ { "Owner" }, { "Player" } })) do
 		if Bridge.looksLikeClientClass(v, player) then
 			State.clientByPlayer[player] = v
 			return v
@@ -5728,7 +5780,7 @@ end
 -- Подписка на ClientService.SquadChanged — событийная замена опросу.
 --
 -- В дампе (deleted/Flux/Services/ClientService lines 46, 104-106) видно, что
--- игра держит сигнал SquadChanged и дёргает его РОВНО в момент, когда сервер
+-- игра держит сигнал SquadChanged и дёргает ��го РОВНО в момент, когда сервер
 -- меняет Squad игроку: ReplicateClient(player,"Squad",v) → Clients[p][k]=v →
 -- SquadChanged:Fire(). Он же срабатывает при роспуске отряда.
 --
@@ -7578,7 +7630,7 @@ end
 -- resolveSpoofedMuzzleOrigin уже ищет такую позицию (сдвиг вправо/влево/вперёд).
 -- patchV138ServerAim патчит X,Y,Z,pitch,yaw в v138 перед отправкой на сервер.
 -- Нам нужно только ПРАВИЛЬНО находить цель и не отфильтровывать её раньше времени.
--- ─────────────────────────────────────────────────────────────────────────────
+-- ────────────────────────────────────────────────────────���────────────────────
 
 -- isValidMultiPointShot: проверяет, достижима ли цель после spoofed muzzle.
 -- Не отфильтровывает если spoof нашёл позицию — это работа patchV138ServerAim.
@@ -10511,7 +10563,7 @@ function Bridge.predictAimPoint(uid, currentPos, origin, bulletSpeed, part, _ext
 	-- жёстко 35 studs/s «~WalkSpeed*2». Но это потолок ПЕШЕХОДА: со Speed-модом
 	-- бегут 42+, в транспорте — сотни. Реальную скорость обрезало, упреждение
 	-- получалось меньше нужного, и чем дальше цель (больше время полёта) — тем
-	-- сильнее недолёт. Именно поэтому «далеко и быстро» = мимо.
+	-- сильнее недолёт. Именно поэто��у «далеко и быстро» = мимо.
 	--
 	-- Кламп нужен только чтобы отсечь всплески репликации (телепо��т даёт
 	-- сотни studs/s за кадр), а не чтобы ограничивать легальное движение.
@@ -10643,7 +10695,7 @@ Bridge._resolveLocalPlayer    = resolveLocalPlayer
 --
 -- Раньше каждый модуль звал MacLib напрямую и городил своё: где-то тоггл
 -- назывался "Enabled", где-то дублировал имя фичи; кейбинды жили то рядом,
--- то в отдельной секции; часть слайдеров сыпала уведомлениями, часть нет;
+-- то в отдельной секции; часть слайдеров сыпала уведомлен��ями, часть нет;
 -- сублейблы были длинными техническими предложениями. Отсюда ощущение
 -- «тяп-л��п» — интерфейс не выглядел сделанным одной рукой.
 --
@@ -10721,7 +10773,7 @@ function Bridge.makeUiKit(ui)
 	end
 
 	-- Уведомления подавлены, пока строится интерфейс: иначе создание
-	-- элементов и автозагрузка конфига выдают пачку тостов на старте.
+	-- элементов и автозаг��узка конфига выдают пачку тостов на старте.
 	local uiReady = false
 	local function notify(title, body)
 		if uiReady and ui.notify then pcall(ui.notify, title, body) end
