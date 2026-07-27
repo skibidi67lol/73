@@ -352,11 +352,16 @@ return function(Lib)
     -- апвелы (now/getgc/isCtrl/...) → именно NO_VIRTUALIZE, НЕ JIT_MAX.
     local findCtrlViaGetgc = LPH_NO_VIRTUALIZE(function()
         if type(getgc) ~= "function" then return nil end
+        -- Если есть filtergc — им уже занимался findCtrlViaFiltergc (нативный,
+        -- узкий). Полный getgc-дамп кучи под Luraph (сотни тысяч объектов) =
+        -- фриз, поэтому как fallback запускаемся ТОЛЬКО без filtergc.
+        if type(filtergc) == "function" then return nil end
         if hooksSetup then return nil end
         local t = now()
         if t - lastExpensiveScanT < EXPENSIVE_SCAN_CD then return nil end
         lastExpensiveScanT = t
-        local ok, gc = pcall(getgc, true)
+        -- getgc(false): только функции (мы всё равно перебираем только function).
+        local ok, gc = pcall(getgc, false)
         if not ok or type(gc) ~= "table" then return nil end
         for _, fn in ipairs(gc) do
             if type(fn) ~= "function" then continue end
@@ -382,11 +387,14 @@ return function(Lib)
 
     local findCamViaGetgc = LPH_NO_VIRTUALIZE(function()
         if type(getgc) ~= "function" then return nil end
+        -- Fallback только без filtergc (см. findCtrlViaGetgc): полный getgc-дамп
+        -- кучи под Luraph = фриз.
+        if type(filtergc) == "function" then return nil end
         if camHooksSetup then return nil end
         local t = now()
         if t - lastExpensiveScanT < EXPENSIVE_SCAN_CD then return nil end
         lastExpensiveScanT = t
-        local ok, gc = pcall(getgc, true)
+        local ok, gc = pcall(getgc, false)
         if not ok or type(gc) ~= "table" then return nil end
         for _, fn in ipairs(gc) do
             if type(fn) ~= "function" then continue end
@@ -542,7 +550,7 @@ return function(Lib)
             if MOV.FakeAnglesPitch and type(a[10]) == "number" then a[10] = (math.random() * 2 - 1) * pAmp end
             if MOV.FakeAnglesLean  and n >= 11                  then a[11] = math.random() * 2 - 1 end
         elseif fakeAngMode == 6 then      -- Twitch (LBY-breaker): снап реал↔180°
-            -- Модель телепорт-щёлкает между «лицом» и «спиной» каждый пакет —
+            -- Модель телепорт-щёлкает между «��ицом» и «спиной» каждый пакет —
             -- на сервере угол не устаканивается → десинк-брейкер как в CS.
             local yaw = (flip > 0) and realYaw or (realYaw + math.pi)
             if MOV.FakeAnglesYaw    and type(a[6])  == "number" then a[6]  = yaw end
@@ -2503,7 +2511,7 @@ return function(Lib)
         -- ВАЖНО: тернарник `noHeader and false or nil` здесь НЕ РАБОТАЕТ и был
         -- причиной дубля «Fly / Fly»: (true and false) = false, затем
         -- (false or nil) = nil — то есть Header всегда получался nil, и kit
-        -- рисовал второй заголовок. В Lua нельзя протащить false через `or`.
+        -- рисовал второй заголовок. В Lua нельзя прота��ить false через `or`.
         -- Поэтому строим таблицу и выставляем поле явным присваиванием.
         local function movFeature(section, title, name, desc, noHeader)
             local opts = {
