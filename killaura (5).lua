@@ -1,4 +1,42 @@
--- killaura v13.0 | nearest-target | melee-mods | viz-equip-guard | cleanup
+-- killaura v14.0 | nearest-target | melee-mods | viz-equip-guard | cleanup
+--[[
+    killaura v14.0 — CHANGELOG от v13.0:
+
+    КРИТИЧЕСКОЕ:
+    1) [reach runaway] applyMeleeMods прибавлял MeleeReachBoost к УЖЕ раздутому
+       _distance на каждый ensureMeleeSvc (каждый тик + каждый свинг) — клиентский
+       reach рос ~25 studs/с бесконечно. Теперь идемпотентно: оригинал хранится в
+       weak-таблице State.kaDistOrig, всегда пишем orig+boost, один раз на экип
+       (kaModsAppliedEq == kaBootEq); stop() возвращает оригинал; слайдеры
+       AnimSpeed/ReachBoost переприменяют моды (0 = вернуть норму).
+    2) [Slash-спам] PacketAuto слал Slash ДО валидации цели: при нерезолвящемся
+       uid/hitPos уходил голый Slash без Impact на каждый тик (~5/с) — палевный
+       паттерн для сервера. Теперь: сначала part/uid/hitPos/bone, фейл = ноль
+       пакетов; Impact уходит через реальный svc._delay (как в дампе _use), а не
+       мгновенно после Slash. Фейл-ретраи гейтятся бэкоффом kaLastAttempt (cd*0.5).
+
+    ОСТАЛЬНОЕ:
+    3) Выключение через UI снимает Impact-стиринг сразу (heartbeat-гейт + UI-сеттер
+       + tick) — раньше ручные удары после off шли в последнюю (мёртвую) цель.
+    4) swingOnce: гейт isLocalAlive — мёртвый игрок не шлёт пакеты.
+    5) scanNetworkModule/start: type-check networkModule — не-таблица из
+       shared.import роняла rawget, pcall(tick) молча глотал, PacketAuto умирал.
+    6) stop(): уничтожаем все Drawing-пулы (кольцо 48 + PacketViz 64+96 Line);
+       снимаем hookfunction-хуки (Impact/_use) с восстановлением оригиналов —
+       раньше реинжект наслаивал хук на хук и держал старый State; возвращаем
+       svc._distance/_timer/_delay и скорость анимаций (AdjustSpeed 1).
+    7) clearMeleeBoot: чистим kaMeleeRep — handler-таблица жила после анэквипа.
+    8) Перф: hideViz/hidePacketViz по dirty-флагу (0 Drawing-записей в кадре при
+       выкл); updateViz один раз в кадр (убран дубль из kaTickCombat); форс-резолв
+       ctx не чаще 1с; бэкофф 3с на фейл-сканы resolveInvSvc/scanMeleeSvc/
+       scanNetworkModule (+ warn'ы не спамят); pickTarget больше не форсит
+       refreshTeamAndRep (форс остался только у dumpDebug); spin-угол по модулю.
+    9) Bridge.isActorDead патчится один раз (guard _kaIsActorDeadPatched) —
+       раньше каждый реинжект наслаивал обёртку поверх обёртки.
+    10) UI-флаги: Distance→KADistance, FOV→KAFOV, Mode→KAMode — коллизии с
+        esp.lua (Distance) и silentaim.lua (FOV/Mode) в MacLib.Options затирали
+        друг друга. Эти три значения в сохранённых конфигах сбросятся один раз.
+]]
 --[[
     BRM5KillAura — v8 (PacketAuto rewrite by dump analysis)
 
@@ -30,8 +68,12 @@ local State   = Lib.State
 -- [FLUX FIX #1] Bridge.isActorDead: library проверяет data.alive (lower),
 -- Flux ActorClass хранит data.Alive (upper) → всё инвертировано.
 -- Патчим сразу после получения Bridge, до любого использования.
+-- v14: guard — патчим ОДИН раз. Раньше каждый (ре)лоад модуля наслаивал
+-- новую обёртку поверх старой (isEnemyActor зовёт это per-actor per-frame
+-- в ESP/SilentAim/killaura), и каждый слой пинил предыдущий инстанс модуля.
 -- ══════════════════════════════════════════════════════════════
-do
+if not Bridge._kaIsActorDeadPatched then
+    Bridge._kaIsActorDeadPatched = true
     local _origDead = Bridge.isActorDead
     Bridge.isActorDead = function(data)
         if type(data) ~= "table" then
@@ -177,6 +219,10 @@ local kaActionTypeInv
 -- ══════════════════════════════════════════════════════════════
 local kaVizLines  = {}
 local kaVizActive = false
+-- v14: dirty-флаги «пул реально показан» — hide-циклы гоняются только на
+-- переходе shown→hidden, а не 50-210 Drawing-записей КАЖДЫЙ кадр при выкл.
+local kaVizShown  = false
+local kaPvShown   = false
 -- v13.1: время последнего PacketAuto-удара — для вспышки прицела-скобок
 local kaPacketPulse = -999
 -- Smooth warp
@@ -238,6 +284,9 @@ local function clearMeleeBoot()
     State.kaWarmupEq       = nil
     State.kaWarmupBusy     = false
     State.kaModsAppliedEq  = nil
+    -- v14: раньше kaMeleeRep НЕ чистился — последняя handler-таблица жила
+    -- после анэквипа/смерти до конца сессии.
+    State.kaMeleeRep       = nil
     State.kaGcScanEq       = nil
     State.kaUseThreadActive = false
     State.kaUseThreadSince  = 0
@@ -550,7 +599,10 @@ local function pickTarget(force, actor)
     -- v13.1: запоминаем текущую цель ДО очистки, чтобы применить гистерезис
     -- (не дёргаться между двумя почти равноудалёнными врагами).
     local prevUid = State.kaTargetUid
-    refreshTeamAndRep(force)
+    -- v14: НЕ форсим — форс-пик из тика (каждые 0.2-0.25с) пробивал 0.35с
+    -- троттл refreshLocalTeamKey+tickRepSyncBatch. Форс-вариант остался
+    -- только у dumpDebug (он зовёт refreshTeamAndRep(true) напрямую).
+    refreshTeamAndRep(false)
     clearKaTarget()
     local pool, source = buildTargetPool(actor)
     if #pool == 0 then
@@ -720,7 +772,11 @@ local function searchInvSvcHandlers(invSvc, eqUid)
 end
 
 -- Получить InventoryService синглтон через getnilinstances + require (кэш Roblox)
+-- v14: бэкофф 3с после фейла — раньше полный проход по nil-инстансам (+ warn)
+-- повторялся на каждый свинг/тик, пока svc не находился.
+local kaInvSvcFailT = 0
 local function resolveInvSvc()
+    if now() - kaInvSvcFailT < 3 then return nil, nil end
     -- Единственный метод: getnilinstances() → require()
     -- Flux уничтожает свои ModuleScript'ы (script:Destroy) после загрузки,
     -- они живут в nil-parent, но require()-кэш Roblox держит результат в памяти.
@@ -743,10 +799,14 @@ local function resolveInvSvc()
     else
         warn("[KA] resolveInvSvc: getnilinstances недоступен в этом экзекуторе.")
     end
+    kaInvSvcFailT = now()
     return nil, nil
 end
 
+-- v14: бэкофф 3с на фейл всего скана (гейтит и warn-спам ниже)
+local kaSvcScanFailT = 0
 local function scanMeleeSvc(actor, rep, eqUid)
+    if now() - kaSvcScanFailT < 3 then return nil end
     -- Получаем InventoryService любым доступным способом
     local invSvc, invSrc = resolveInvSvc()
     if type(invSvc) == "table" then
@@ -786,6 +846,7 @@ local function scanMeleeSvc(actor, rep, eqUid)
         end
     end
     warn("[KA] scanMeleeSvc: svc не найден. rep=", tostring(rep), "actor=", tostring(actor))
+    kaSvcScanFailT = now()
     return nil
 end
 
@@ -865,11 +926,18 @@ end
 -- Сервер не затронут: _delay / _distance меняются только в памяти клиента.
 local function applyMeleeMods(svc)
     if not svc then return end
+    -- v14 [CRITICAL]: идемпотентность. Вызывается на КАЖДЫЙ ensureMeleeSvc
+    -- (каждый тик + каждый свинг), а base перечитывался из УЖЕ раздутого
+    -- _distance → клиентский reach рос ~25 studs/с бесконечно. Теперь:
+    -- один раз на экип (kaBootEq выставлен ДО вызова в ensureMeleeSvc),
+    -- слайдеры сбрасывают kaModsAppliedEq для переприменения.
+    if State.kaModsAppliedEq == State.kaBootEq then return end
+    State.kaModsAppliedEq = State.kaBootEq
     local animSpeed  = CONFIG.MeleeAnimSpeed  or 1.0
     local reachBoost = CONFIG.MeleeReachBoost or 0
 
-    -- Скорость анимации удара
-    if animSpeed ~= 1.0 then
+    -- Скорость анимации удара (применяем всегда: 1.0 = вернуть норму после слайдера)
+    if type(animSpeed) == "number" and animSpeed > 0 then
         for _, field in ipairs({"_slash", "_slashTP", "_equip", "_idle"}) do
             local track = rawget(svc, field)
             if track and type(track.AdjustSpeed) == "function" then
@@ -878,11 +946,19 @@ local function applyMeleeMods(svc)
         end
     end
 
-    -- Клиентский reach (используется MeleeInventoryReplicator для raycast-эффектов)
-    if reachBoost ~= 0 then
-        local base = rawget(svc, "_distance")
-        if type(base) == "number" then
+    -- Клиентский reach (используется MeleeInventoryReplicator для raycast-эффектов).
+    -- v14 [CRITICAL]: ОРИГИНАЛ храним в weak-таблице kaDistOrig и всегда пишем
+    -- orig + boost (не base + boost от текущего значения). stop() возвращает orig.
+    State.kaDistOrig = State.kaDistOrig or setmetatable({}, { __mode = "k" })
+    local base = State.kaDistOrig[svc]
+    if base == nil then base = rawget(svc, "_distance") end
+    if type(base) == "number" then
+        if reachBoost ~= 0 then
+            State.kaDistOrig[svc] = base
             rawset(svc, "_distance", base + reachBoost)
+        elseif State.kaDistOrig[svc] ~= nil then
+            -- boost выключен слайдером → возвращаем норму
+            rawset(svc, "_distance", base)
         end
     end
 end
@@ -1289,10 +1365,16 @@ end
 -- ══════════════════════════════════════════════════════════════
 -- ХОТ-СКАН: filtergc + getnilinstances→getupvalue×512. Под Luraph обязан быть
 -- нативным (LPH_NO_VIRTUALIZE), иначе один проход по раздутому GC = фриз.
+-- v14: type-check networkModule (start() мог записать функцию/userdata из
+-- shared.import → rawget кидал, pcall(tick) глотал, PacketAuto молча умирал)
+-- + бэкофф 3с после фейла: раньше кэшировался только успех, и полный скан
+-- кучи повторялся на каждый PacketAuto-свинг.
+local kaNetScanFailT = 0
 local scanNetworkModule = LPH_NO_VIRTUALIZE(function()
-    if State.networkModule and rawget(State.networkModule, "_code") ~= nil then
+    if type(State.networkModule) == "table" and rawget(State.networkModule, "_code") ~= nil then
         return State.networkModule   -- уже найден и закэширован
     end
+    if now() - kaNetScanFailT < 3 then return nil end
 
     -- filtergc — самый быстрый путь (ищет по всей куче GC)
     if type(filtergc) == "function" then
@@ -1313,9 +1395,9 @@ local scanNetworkModule = LPH_NO_VIRTUALIZE(function()
 
     -- getnilinstances → LocalScript "client" → getscriptclosure → upvalue scan
     -- Flux/client уничтожен (script:Destroy) но живёт в getnilinstances
-    if type(getnilinstances) ~= "function" then return nil end
+    if type(getnilinstances) ~= "function" then kaNetScanFailT = now() return nil end
     local ok1, nils = pcall(getnilinstances)
-    if not ok1 or type(nils) ~= "table" then return nil end
+    if not ok1 or type(nils) ~= "table" then kaNetScanFailT = now() return nil end
 
     for _, inst in ipairs(nils) do
         local okC, cls = pcall(function() return inst.ClassName end)
@@ -1353,6 +1435,7 @@ local scanNetworkModule = LPH_NO_VIRTUALIZE(function()
             end
         end
     end
+    kaNetScanFailT = now()
     return nil
 end)
 
@@ -1395,11 +1478,9 @@ local function triggerPacketAutoFire(actor, aimPart, targetData)
         return false, "no_v3fn"
     end
 
-    -- Slash
-    local slashN = math.random(1, 3)
-    netFire("InventoryAction", "Slash", slashN)
-
-    -- Impact — немедленно (без _delay, как указано)
+    -- v14 [CRITICAL]: СНАЧАЛА полная валидация цели, ПОТОМ пакеты.
+    -- Раньше Slash уходил ДО резолва uid/hitPos: при фейле сервер получал
+    -- голый Slash без Impact на каждый ретрай (~5/с) — палевный паттерн.
     local part   = resolveHitPart(aimPart, targetData)
     local uid    = resolveHitUid(targetData and targetData.uid, part or aimPart)
     local bone   = (CONFIG.KillAuraForceBone)
@@ -1434,7 +1515,25 @@ local function triggerPacketAutoFire(actor, aimPart, targetData)
         warn("[KA] PacketAuto: vector3ToTable вернул nil")
         return false, "v3fn_nil"
     end
-    netFire("InventoryAction", "Impact", t, uid, bone)
+
+    -- Slash — только после успешной валидации (фейл выше = ноль пакетов)
+    netFire("InventoryAction", "Slash", math.random(1, 3))
+
+    -- v14 [CRITICAL]: Impact через реальный _delay оружия — дамп _use: игра
+    -- шлёт его через task.delay(svc._delay), а не мгновенно после Slash.
+    -- Пару Slash→Impact НЕ рвём, даже если ауру выключили/умерли за эти ~0.2с:
+    -- сама игра шлёт Impact безусловно, а одиночный Slash без Impact — ровно
+    -- та сигнатура, которую этот фикс убирает.
+    local svc = State.kaMeleeSvc
+    local d = (type(svc) == "table" and rawget(svc, "_delay")) or 0.2
+    if type(d) ~= "number" or d < 0 then d = 0.2 end
+    if d > 0.01 then
+        task.delay(d, function()
+            netFire("InventoryAction", "Impact", t, uid, bone)
+        end)
+    else
+        netFire("InventoryAction", "Impact", t, uid, bone)
+    end
     return true
 end
 
@@ -1444,6 +1543,11 @@ local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
     if not kaHasValidAim(aimPart, aimPoint, targetData) then return false, "no_aim" end
     local _, cd = getKaTimings()
     if not resetCd and now() - (State.kaLastSwing or 0) < cd then return false, "cooldown" end
+    -- v14 [CRITICAL #2b]: бэкофф фейл-ретраев. Фейл не двигает kaLastSwing
+    -- (только markSwingSuccess), поэтому раньше ретрай шёл на КАЖДЫЙ тик.
+    -- kaLastSwing не трогаем — на нём висит impact-flash кольца.
+    if not resetCd and now() - (State.kaLastAttempt or 0) < cd * 0.5 then return false, "backoff" end
+    State.kaLastAttempt = now()
     local tpos = kaRefPos(targetData) or (aimPart and aimPart.Position) or aimPoint
     if typeof(tpos) == "Vector3"
         and (tpos - kaLosOrigin(actor)).Magnitude > kaDist() + 1 then
@@ -1564,6 +1668,8 @@ end
 
 local function hideViz()
     kaVizActive = false
+    if not kaVizShown then return end   -- v14: уже спрятано — 0 записей
+    kaVizShown = false
     for i = 1, #kaVizLines do
         kaVizLines[i].Visible = false
     end
@@ -1648,11 +1754,41 @@ local function ensurePacketViz()
 end
 
 local function hidePacketViz()
-    if not kaPvBuilt then return end
+    if not kaPvBuilt or not kaPvShown then return end   -- v14: dirty-флаг
+    kaPvShown = false
     for i = 1, KA_PV_SEG do kaPvRing[i].Visible = false; kaPvBase[i].Visible = false end
     for w = 1, KA_PV_SHOCK do
         local ring = kaPvShock[w]
         for i = 1, KA_PV_SEG do ring[i].Visible = false end
+    end
+end
+
+-- v14: полное уничтожение Drawing-пулов на stop()/реинжект — раньше пулы
+-- только прятались и жили до конца сессии (48 ring + 64 PacketViz + 96 shock Line).
+local function kaDestroyVizPools()
+    for i = #kaVizLines, 1, -1 do
+        Bridge.destroyDrawing(kaVizLines[i])
+        kaVizLines[i] = nil
+    end
+    kaVizAngleCacheN = 0
+    kaVizShown  = false
+    kaVizActive = false
+    if kaPvBuilt then
+        for i = 1, KA_PV_SEG do
+            Bridge.destroyDrawing(kaPvRing[i]); kaPvRing[i] = nil
+            Bridge.destroyDrawing(kaPvBase[i]); kaPvBase[i] = nil
+        end
+        for w = 1, KA_PV_SHOCK do
+            local ring = kaPvShock[w]
+            if ring then
+                for i = 1, KA_PV_SEG do Bridge.destroyDrawing(ring[i]); ring[i] = nil end
+            end
+            kaPvShock[w]  = nil
+            kaPvShockT[w] = -999
+        end
+        kaPvShockHead = 1
+        kaPvBuilt = false
+        kaPvShown = false
     end
 end
 
@@ -1700,6 +1836,7 @@ local function updatePacketViz(target, cam)
     local topS, onT = cam:WorldToViewportPoint(headPos)
     local botS, onB = cam:WorldToViewportPoint(feetPos)
     if not (onT and onB) or topS.Z <= 0.01 or botS.Z <= 0.01 then hidePacketViz() return end
+    kaPvShown = true   -- v14: дальше точно рисуем — взводим dirty-флаг
 
     local minY  = math.min(topS.Y, botS.Y)
     local maxY  = math.max(topS.Y, botS.Y)
@@ -1857,7 +1994,10 @@ local function updateViz(actor)
 
     -- Spin
     if doSpin then
-        kaVizSpinAngle = kaVizSpinAngle + spinSpeed * dt
+        -- v14: ограничиваем угол — рос бесконечно (потеря float-точности за
+        -- долгую сессию). Период 20π: общий для гармоник spin/0.7/0.4 ниже,
+        -- поэтому wrap без визуального скачка (2π ломал бы фазы 0.7/0.4).
+        kaVizSpinAngle = (kaVizSpinAngle + spinSpeed * dt) % (math.pi * 20)
     end
 
     local radiusX  = baseRadius * (1 + squish)
@@ -1953,6 +2093,8 @@ local function updateViz(actor)
         end
     end
 
+    -- v14: draw-цикл выше уже выставил Visible всем сегментам — флаг отражает итог
+    kaVizShown  = anyVis
     kaVizActive = anyVis
     if not anyVis then hideViz() end
 end
@@ -1964,7 +2106,8 @@ local function kaTickCombat(actor, ctx, autoSwing)
         pickTarget(true, actor)
     end
     local target, aimPart, aimPoint = State.kaTarget, State.kaAimPart, State.kaAimPoint
-    updateViz(actor)
+    -- v14: updateViz отсюда убран — его уже зовёт per-frame viz-коннект,
+    -- дубль давал 24-48 лишних WorldToViewportPoint на каждый боевой тик.
     if not target or typeof(aimPoint) ~= "Vector3" then
         setPhase("no_target")
         -- Hook: снимаем стиринг при потере цели (не перенаправлять удар в пустоту)
@@ -2014,7 +2157,9 @@ local function tickManualAssist()
 end
 
 local function tick()
-    if not CONFIG.KillAura then clearKaTarget() return end
+    -- v14 [FIX 3]: releaseSwingState — иначе Impact-хук продолжал стирить
+    -- ручные удары в последнюю (возможно мёртвую) цель после выключения.
+    if not CONFIG.KillAura then clearKaTarget() releaseSwingState() return end
     if not onLifeState() then setPhase("dead") return end
     -- Автоудар: PacketAuto и LegitAuto; Hook — только ручной ассист
     if (CONFIG.KillAuraMode or "LegitAuto") == "Hook" then return tickManualAssist() end
@@ -2025,7 +2170,12 @@ local function tick()
     else
         ctx = resolveMeleeContext(false)
     end
-    if not ctx then ctx = resolveMeleeContext(true) end
+    -- v14: форс-ретрай не чаще 1с — безусловный форс пробивал негатив-кэш
+    -- (kaCtxEq) и дёргал Bridge.resolveLocalActor(true) каждый тик, пока в
+    -- руках огнестрел.
+    if not ctx and now() - (State.kaCtxTime or 0) > 1.0 then
+        ctx = resolveMeleeContext(true)
+    end
     if not ctx then
         clearKaTarget()
         setPhase("no_melee")
@@ -2036,6 +2186,31 @@ local function tick()
     ctx.actor = actor
     ensureMeleeSvc(actor, ctx)
     kaTickCombat(actor, ctx, true)
+end
+
+-- v14: тело per-frame viz-кадра. Именованная функция (без аллокации замыкания
+-- в кадре); зовётся из Heartbeat под pcall — throw больше не молчит.
+local kaVizErrWarnT = 0
+local function kaVizFrame()
+    -- [FIX] Валидируем что equipped не изменился с момента последнего ctx.
+    -- resolveMeleeContext кэшируется по kaCtxEq — если _equipped сменился,
+    -- ctx немедленно становится nil (не ждём 1.5s cache expiry).
+    -- Работа гейтится по State.kaCtx: без melee-контекста ни resolveActor,
+    -- ни normalizeEqUid (tostring-аллокация) в кадре не выполняются.
+    local ctx = State.kaCtx
+    local actor = ctx and resolveActor(ctx) or nil   -- резолвим 1 раз за кадр
+    if ctx and actor then
+        local curEq = normalizeEqUid(rawget(actor, "_equipped")) or ""
+        if curEq ~= (State.kaCtxEq or "") then
+            -- Оружие сменилось — скрываем viz немедленно
+            State.kaCtx     = nil
+            State.kaCtxTime = 0
+            hideViz()
+            hidePacketViz()
+            return
+        end
+    end
+    updateViz(actor)
 end
 
 local function dumpDebug(testSwing)
@@ -2094,7 +2269,9 @@ function _M.start()
     pcall(function()
         if type(shared) == "table" and type(shared.import) == "function" then
             local ok, net = pcall(shared.import, "network")
-            if ok then
+            -- v14 [FIX 5]: только таблица — функция/userdata отсюда роняла
+            -- rawget в scanNetworkModule (ошибку глотал pcall(tick)).
+            if ok and type(net) == "table" then
                 State.networkModule       = net
                 State.networkModuleSource = "shared.import"
             end
@@ -2129,7 +2306,15 @@ function _M.start()
     local acc = 0
     -- Per-frame kill-aura тик. Под Luraph нативно (LPH_NO_VIRTUALIZE).
     kaConn = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
-        if not State.running or not CONFIG.KillAura then return end
+        if not State.running or not CONFIG.KillAura then
+            -- v14 [FIX 3]: tick() при выкл вообще не зовётся (гейт здесь),
+            -- поэтому стиринг снимаем ТУТ, один раз (dirty-проверка).
+            if State.kaImpactSteer or State.kaSwingBusy or State.kaTarget then
+                clearKaTarget()
+                releaseSwingState()
+            end
+            return
+        end
         acc = acc + dt
         if acc < (CONFIG.KillAuraTickInterval or 0.2) then return end
         acc = 0
@@ -2139,25 +2324,15 @@ function _M.start()
     -- отставало на кадр и «ползло» при шифтлоке/резком повороте. Heartbeat
     -- выполняется ПОСЛЕ камеры — проекция совпадает с тем, что видит игрок.
     -- Per-frame viz-тик (проекция кольца). Под Luraph нативно.
+    -- v14: ВЕСЬ кадр под pcall (kaVizFrame) — раньше resolveActor/normalizeEqUid
+    -- шли до pcall, и throw из Bridge.getActorTable молча ронял кадр без лога.
     kaVizConn = RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
         if not State.running or not CONFIG.KillAura then hideViz(); hidePacketViz() return end
-        -- [FIX] Валидируем что equipped не изменился с момента последнего ctx.
-        -- resolveMeleeContext кэшируется по kaCtxEq — если _equipped сменился,
-        -- ctx немедленно становится nil (не ждём 1.5s cache expiry).
-        local ctx = State.kaCtx
-        local actor = ctx and resolveActor(ctx) or nil   -- резолвим 1 раз за кадр
-        if ctx and actor then
-            local curEq = normalizeEqUid(rawget(actor, "_equipped")) or ""
-            if curEq ~= (State.kaCtxEq or "") then
-                -- Оружие сменилось — скрываем viz немедленно
-                State.kaCtx     = nil
-                State.kaCtxTime = 0
-                hideViz()
-                hidePacketViz()
-                return
-            end
+        local ok, err = pcall(kaVizFrame)
+        if not ok and now() - kaVizErrWarnT > 3 then
+            kaVizErrWarnT = now()
+            warn("[KA] viz frame error:", tostring(err))
         end
-        pcall(updateViz, actor)
     end))
     task.defer(function()
         if not State.running or not CONFIG.KillAura then return end
@@ -2169,6 +2344,28 @@ function _M.start()
     log("KA", "v3 started | dist=", kaDist())
 end
 
+-- v14: откат клиентских модов одного svc (stop/реинжект): скорость анимаций,
+-- _distance (из kaDistOrig, CRITICAL FIX #1) и _timer/_delay (из kaTimerOrig —
+-- писались _use-хуком, но никогда не возвращались).
+local function kaRestoreSvcMods(svc)
+    if type(svc) ~= "table" then return end
+    for _, field in ipairs({ "_slash", "_slashTP", "_equip", "_idle" }) do
+        local track = rawget(svc, field)
+        if track and type(track.AdjustSpeed) == "function" then
+            pcall(track.AdjustSpeed, track, 1)
+        end
+    end
+    local dOrig = State.kaDistOrig
+    local base  = type(dOrig) == "table" and dOrig[svc] or nil
+    if type(base) == "number" then pcall(rawset, svc, "_distance", base) end
+    local tOrig = State.kaTimerOrig
+    local orig  = type(tOrig) == "table" and tOrig[svc] or nil
+    if type(orig) == "table" then
+        if type(orig.t) == "number" then pcall(rawset, svc, "_timer", orig.t) end
+        if type(orig.d) == "number" then pcall(rawset, svc, "_delay", orig.d) end
+    end
+end
+
 function _M.stop()
     if kaConn     then kaConn:Disconnect()     kaConn     = nil end
     if kaVizConn  then kaVizConn:Disconnect()  kaVizConn  = nil end
@@ -2176,12 +2373,49 @@ function _M.stop()
     if kaCharConn  then kaCharConn:Disconnect() kaCharConn  = nil end
     hideViz()
     hidePacketViz()
+    -- v14: пулы уничтожаем целиком (раньше только прятались и текли по реинжекту)
+    kaDestroyVizPools()
     clearKaTarget()
     releaseSwingState()
     -- Сбрасываем Hook-стиринг
     State.kaImpactSteer = false
     State.kaImpactPart  = nil
     State.kaImpactUid   = nil
+    -- v14: снимаем hookfunction-хуки с восстановлением оригиналов. Гард дедупа
+    -- живёт в State — свежий State при реинжекте хукал ту же функцию повторно,
+    -- и каждый слой пинил State прошлой сессии.
+    if type(hookfunction) == "function" then
+        for fn, orig in pairs(State.kaImpactHookedFns or {}) do
+            pcall(hookfunction, fn, orig)
+        end
+        for fn, orig in pairs(State.kaUseHookedFns or {}) do
+            pcall(hookfunction, fn, orig)
+        end
+    end
+    State.kaImpactHookedFns = nil
+    State.kaImpactFnHooked  = nil
+    State.kaUseHookedFns    = nil
+    State.kaUseSpeedHooked  = nil
+    -- v14: возвращаем клиентские моды всем затронутым svc (текущему и всем,
+    -- чьи оригиналы запомнены в weak-таблицах)
+    local restored = {}
+    local function restoreOnce(svc)
+        if type(svc) == "table" and not restored[svc] then
+            restored[svc] = true
+            pcall(kaRestoreSvcMods, svc)
+        end
+    end
+    restoreOnce(State.kaMeleeSvc)
+    if type(State.kaDistOrig) == "table" then
+        for svc in pairs(State.kaDistOrig) do restoreOnce(svc) end
+    end
+    if type(State.kaTimerOrig) == "table" then
+        for svc in pairs(State.kaTimerOrig) do restoreOnce(svc) end
+    end
+    State.kaDistOrig  = nil
+    State.kaTimerOrig = nil
+    -- Полный сброс melee-бутстрапа: рестарт заново найдёт svc и переприменит моды
+    clearMeleeBoot()
 end
 
 function _M.toggle()
@@ -2195,6 +2429,9 @@ function _M.dumpStatus()  dumpDebug(false) end
 function _M.debugDump()   dumpDebug(true)  end
 
 function _M.swingOnce()
+    -- v14 [FIX 4]: раньше force=true обходил alive-гейт resolveMeleeContext,
+    -- и performSwing слал FireServer мёртвым игроком.
+    if not isLocalAlive() then return false, "dead" end
     local ctx   = resolveMeleeContext(true)
     local actor = ctx and resolveActor(ctx) or nil
     local target, part, pt = pickTarget(true, actor)
@@ -2225,11 +2462,19 @@ function _M.buildUI(ui)
     K.feature(L, {
         Title = "Kill Aura", Flag = "KillAura",
         get = function() return CONFIG.KillAura end,
-        set = function(v) CONFIG.KillAura = v end,
+        set = function(v)
+            CONFIG.KillAura = v
+            -- v14 [FIX 3]: off → сразу снимаем стиринг Impact-хука, не ждём
+            -- heartbeat (иначе ручной удар мог уйти в устаревшую цель).
+            if not v then clearKaTarget() releaseSwingState() end
+        end,
         Desc = "hits whoever is in range for u\nbind works on PC + mobile",
     })
+    -- v14: флаги Mode/Distance/FOV → KA-префикс. "Distance" бился с Toggle
+    -- esp.lua, "FOV" — со слайдером silentaim.lua (MacLib.Options общие на все
+    -- модули, коллизия = чужое значение затирает наше). "Mode" — превентивно.
     K.dropdown(L, {
-        Name = "Mode", Flag = "Mode",
+        Name = "Mode", Flag = "KAMode",
         Options = { "Hook", "PacketAuto", "LegitAuto" },
         Default = CONFIG.KillAuraMode or "Hook",
         Callback = function(v) CONFIG.KillAuraMode = v end,
@@ -2237,11 +2482,11 @@ function _M.buildUI(ui)
     })
 
     K.group(L, "Targeting")
-    K.slider(L, { Name = "Distance", Flag = "Distance", Default = CONFIG.KillAuraDistance,
+    K.slider(L, { Name = "Distance", Flag = "KADistance", Default = CONFIG.KillAuraDistance,
         Min = 5, Max = 60, Suffix = " st",
         Callback = function(v) CONFIG.KillAuraDistance = v end,
         Desc = "how far we look for someone to hit" })
-    K.slider(L, { Name = "FOV", Flag = "FOV", Default = CONFIG.KillAuraFOV,
+    K.slider(L, { Name = "FOV", Flag = "KAFOV", Default = CONFIG.KillAuraFOV,
         Min = 30, Max = 360, Suffix = "°",
         Callback = function(v) CONFIG.KillAuraFOV = v end,
         Desc = "360 = all around u" })
@@ -2281,12 +2526,18 @@ function _M.buildUI(ui)
     local R = (gmtab or tab):Section({ Side = "Right" })
     R:Header({ Name = "Melee Mods" })
     R:SubLabel({ Text = "client only — server packets stay untouched" })
+    -- v14: слайдеры сбрасывают guard идемпотентности и переприменяют моды к
+    -- текущему svc сразу (applyMeleeMods пишет orig+boost — без накопления).
+    local function kaReapplyMods()
+        State.kaModsAppliedEq = nil
+        if State.kaMeleeSvc then pcall(applyMeleeMods, State.kaMeleeSvc) end
+    end
     K.slider(R, { Name = "Anim Speed", Flag = "AnimSpeed", Default = CONFIG.MeleeAnimSpeed,
         Min = 1, Max = 5, Precision = 1, Suffix = "x",
-        Callback = function(v) CONFIG.MeleeAnimSpeed = v end })
+        Callback = function(v) CONFIG.MeleeAnimSpeed = v; kaReapplyMods() end })
     K.slider(R, { Name = "Reach Boost", Flag = "ReachBoost", Default = CONFIG.MeleeReachBoost,
         Min = 0, Max = 15, Precision = 1, Suffix = " st",
-        Callback = function(v) CONFIG.MeleeReachBoost = v end })
+        Callback = function(v) CONFIG.MeleeReachBoost = v; kaReapplyMods() end })
 
     -- Множитель и масштаб задержки имеют смысл только при ручной скорости —
     -- прячем их, пока тумблер выключен.
