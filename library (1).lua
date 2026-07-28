@@ -1,4 +1,42 @@
 --[[
+	BRM5Lib_v21 — CHANGELOG от v20:
+
+	FIX КОНФИГА (главное):
+	  makeUiKit — Colorpicker при LoadConfig восстанавливался через :SetColor,
+	    который Callback НЕ вызывает → свотч показывал сохранённый цвет, а CONFIG
+	    оставался с дефолтом (все 24 колорпикера сюиты). Добавлены bindOpt-биндинги
+	    + Bridge.reconcileUiConfig; авто-вызов из kit.ready(), явный — kit.reconcile().
+	  flag() — детект коллизий флагов с warn + опциональный ns-префикс модуля.
+	    Раньше два элемента с одним флагом молча вытесняли друг друга в
+	    MacLib.Options и один из них перестал сохраняться.
+	  kit.feature — flag(o.Flag) вызывался ДВАЖДЫ (в Toggle и в return) —
+	    ложное срабатывание детектора; commit теперь рвёт эхо-петлю по значению.
+	  kit.toggle — мёртвый guard стал рабочим, тост только на реальное изменение,
+	    второй возврат = программный сет без тоста.
+	  kit.slider/dropdown/color — поддержка o.get для живого дефолта.
+	  kit.button — флаг убран: Button не поддерживается системой конфигов, а его
+	    флаг мог вытеснить из MacLib.Options реальный элемент.
+
+	FIX SILENTAIM FOV:
+	  getAimFovHalfDeg() — единый источник истины. Слайдер = ПОЛНЫЙ угол конуса
+	    (диаметр круга), сравнения идут с угловым РАДИУСОМ. Раньше сырое значение
+	    сравнивали с радиусом → конус вдвое шире нарисованного круга (на дефолте
+	    120 это 240°, цеплялись враги вне экрана). Переведены все 7 сайтов.
+	  refreshAimTarget — sticky-цель (0.35s) отдавалась без перепроверки fov и
+	    смерти → стрельба по трупам и по врагам вне фова.
+	  Дефолт SilentAimFOV 15 → 60.
+
+	FIX ESP NAMES:
+	  formatEspLabelWithDistance — гейт CONFIG.EspShowName (новый ключ, дефолт true).
+	    Имя актора раньше рисовалось безусловно, выключить было нечем.
+
+	LEAK FIX (pruneAllCaches):
+	  combatMuzzleCache — ключ из позиции с точностью 0.01 стада, TTL проверялся
+	    только на чтении, свипа не было → рост всю сессию.
+	  exposedCacheByUid — держал BasePart уничтоженных ригов (character-деревья
+	    не собирались GC).
+	  resolverThrottle, clientBulletHitFired — стамп на каждый актор/выстрел без прунинга.
+
 	BRM5Lib_v20 — CHANGELOG от v19:
 
 	FIX MELEE IN HANDS:
@@ -177,7 +215,8 @@ local CONFIG = {
 	ServerAimDebug = false,
 	VizDebug = false,
 	SilentAim = false,
-	SilentAimFOV = 15,
+	SilentAimFOV = 60,            -- ПОЛНЫЙ угол конуса; сравнения через getAimFovHalfDeg()
+	EspShowName = true,           -- имя актора в ESP-лейбле
 	SilentAimBone = "Head",
 	TeamCheck = true,
 	Prediction = true,
@@ -5044,7 +5083,7 @@ function Bridge.resolveServerAimPoint(aimPart, head, muzzleOrigin, ctx, uid, cam
 	end
 	uid = Bridge.resolveActorUidForPart(head, uid)
 	cam = cam or getCamera()
-	maxAngle = maxAngle or CONFIG.SilentAimFOV or 15
+	maxAngle = maxAngle or Bridge.getAimFovHalfDeg()
 
 	local model = head.Parent
 	if Bridge.hasClearShotToPoint(muzzleOrigin, head.Position, head) then
@@ -6214,6 +6253,9 @@ function Bridge.shouldSkipActorCollect(class, player, squad, teamKey, uid)
 end
 
 function Bridge.formatEspLabelWithDistance(data, camPos)
+	-- EspShowName=false → имя не рисуем вовсе. ESP-модуль по пустой строке
+	-- гасит сам Drawing (иначе висел бы пустой text-объект).
+	if CONFIG.EspShowName == false then return "" end
 	local label = Bridge.formatEspActorLabel(data)
 	if CONFIG.EspShowDistance == false or not data or not data.root or not camPos then
 		return label
@@ -7952,7 +7994,7 @@ function Bridge.resolveResolverLite(muzzleOrigin, model, uid, cam, maxAngle)
 		if rlDist > (CONFIG.ResolverLiteMaxDist or 600) then return nil, nil, nil end
 	end
 	cam = cam or getCamera()
-	maxAngle = maxAngle or CONFIG.SilentAimFOV or 15
+	maxAngle = maxAngle or Bridge.getAimFovHalfDeg()
 	local cacheKey = Bridge.exposedCacheKey(uid, model)
 	local now = os.clock()
 	-- v22: дистанционный троттлинг — дальние акторы пересканируются реже
@@ -8110,7 +8152,7 @@ function Bridge.findAnyVisibleBone(model, origin, cam, maxAngle)
 		return Bridge.hasClearShotToPoint(o, wp, b, false)
 	end)
 	if not visible or not bone then return nil, nil end
-	if cam and point and Bridge.angleFromCameraLook(cam, point) > (maxAngle or CONFIG.SilentAimFOV or 15) * 1.15 then
+	if cam and point and Bridge.angleFromCameraLook(cam, point) > (maxAngle or Bridge.getAimFovHalfDeg()) * 1.15 then
 		return nil, nil
 	end
 	return bone, point
@@ -8288,7 +8330,7 @@ function Bridge.resolveLiteMultiPointAim(data, origin, _ctx, cam, maxAngle)
 	end
 	local model = data.model
 	cam = cam or getCamera()
-	maxAngle = maxAngle or CONFIG.SilentAimFOV or 15
+	maxAngle = maxAngle or Bridge.getAimFovHalfDeg()
 	local head = model:FindFirstChild("Head")
 	if not head or not head:IsA("BasePart") then return nil, nil, nil, nil end
 	local aimPt = head.Position
@@ -8351,7 +8393,7 @@ function Bridge.computeCombatAimPoint(data, origin, ctx, cam, maxAngle)
 	if not data or not data.model then return nil, nil, 3, nil end
 	local model = data.model
 	cam = cam or getCamera()
-	maxAngle = maxAngle or CONFIG.SilentAimFOV or 15
+	maxAngle = maxAngle or Bridge.getAimFovHalfDeg()
 	local muzzleOrigin = Bridge.getAimLosOrigin(origin)
 	local viewOrigin = Bridge.getLocalViewOrigin() or muzzleOrigin
 	local losFn = function(o, wp, bone)
@@ -8451,7 +8493,7 @@ function Bridge.refreshAimTarget(originHint, force)
 
 	State.inAimRefresh = true
 	local losOrigin = Bridge.getAimLosOrigin(originHint)
-	local maxAngle = CONFIG.SilentAimFOV or 15
+	local maxAngle = Bridge.getAimFovHalfDeg()
 	local maxDist = CONFIG.SilentAimMaxDistance or 500
 	local ctx = Bridge.getAimWeaponContext and Bridge.getAimWeaponContext(true)
 		or Bridge.peekWeaponContext()
@@ -8567,9 +8609,13 @@ function Bridge.refreshAimTarget(originHint, force)
 
 	if not best then
 		local sticky = CONFIG.MultiPointStickySec or 0.35
+		-- FIX: sticky отдавал прошлую цель без ПЕРЕПРОВЕРКИ fov и смерти —
+		-- отсюда «стреляет во врага вне фова» и добивание трупов 0.35s.
 		if CONFIG.LiteMultiPoint and State.shotAimTarget and State.shotAimTarget.Parent
 			and State.aimTargetPart and State.aimTargetPart.Parent
-			and now - (State.aimLockTime or 0) < sticky then
+			and now - (State.aimLockTime or 0) < sticky
+			and not Bridge.isActorDead(State.actors and State.actors[State.aimTargetUid])
+			and Bridge.isAimTargetInFov(State.aimTargetPart, State.aimAimPoint, cam, maxAngle) then
 			local aimPt = State.aimAimPoint or State.aimTargetPart.Position
 			local reSpoof, _, _, reOk = Bridge.findLiteMultiPointShot(
 				losOrigin, aimPt, State.aimTargetPart, State.aimTargetUid
@@ -8683,7 +8729,7 @@ end
 
 function Bridge.isAimTargetInFov(target, aimPoint, cam, maxAngle)
 	if not target or not target.Parent or not cam then return false end
-	maxAngle = maxAngle or CONFIG.SilentAimFOV or 15
+	maxAngle = maxAngle or Bridge.getAimFovHalfDeg()
 	local checkPos = typeof(aimPoint) == "Vector3" and aimPoint or target.Position
 	return Bridge.angleFromCameraLook(cam, checkPos) <= maxAngle
 end
@@ -8833,6 +8879,16 @@ end
 function Bridge.angleFromCameraLook(cam, worldPos)
 	if not cam then return 180 end
 	return Bridge.angleFromLook(cam.CFrame.Position, cam.CFrame.LookVector, worldPos)
+end
+
+-- ── FOV: слайдер хранит ПОЛНЫЙ угол конуса (= диаметр круга на экране) ──────
+-- Все сравнения идут с угловым РАДИУСОМ от оси камеры (angleFromCameraLook
+-- отдаёт 0..180). Раньше сырое значение слайдера сравнивали с радиусом —
+-- конус выходил вдвое шире нарисованного круга (на дефолте 120 это 240°,
+-- т.е. цеплялись враги вообще вне экрана). Единый источник истины.
+function Bridge.getAimFovHalfDeg()
+	local fov = tonumber(CONFIG.SilentAimFOV) or 60
+	return math.clamp(fov, 1, 360) * 0.5
 end
 
 function Bridge.getBoneVisSamplePoints(bone)
@@ -9813,6 +9869,45 @@ function Bridge.pruneAllCaches(now)
 	State.lastCacheGc = now
 	State.lastSpoofCachePrune = 0
 	Bridge.pruneSpoofCaches(now)
+	-- v21 LEAK FIX: три таблицы росли всю сессию и держали мёртвые Instance.
+	-- combatMuzzleCache — ключ строится из позиции с точностью 0.01 стада,
+	-- т.е. почти каждый выстрел плодил новый ключ; TTL проверялся только на
+	-- чтении, свипа не было вовсе.
+	if State.combatMuzzleCache then
+		for k, e in pairs(State.combatMuzzleCache) do
+			if type(e) ~= "table" or now - (e.t or 0) > 1.0 then
+				State.combatMuzzleCache[k] = nil
+			end
+		end
+	end
+	-- exposedCacheByUid держал BasePart уже уничтоженных ригов → целые
+	-- character-деревья не собирались GC.
+	if State.exposedCacheByUid then
+		for k, e in pairs(State.exposedCacheByUid) do
+			local part = type(e) == "table" and e.part or nil
+			if type(e) ~= "table" or now - (e.t or 0) > 5.0
+				or (part and not part.Parent) then
+				State.exposedCacheByUid[k] = nil
+			end
+		end
+	end
+	-- resolverThrottle: по стампу на каждый актор/модель, включая длинные
+	-- "mdl:"..GetFullName() строки.
+	if State.resolverThrottle then
+		for k, t in pairs(State.resolverThrottle) do
+			if type(t) ~= "number" or now - t > 10.0 then
+				State.resolverThrottle[k] = nil
+			end
+		end
+	end
+	-- clientBulletHitFired: по uid на каждый force-hit выстрел, без прунинга.
+	if State.clientBulletHitFired then
+		for uid, t in pairs(State.clientBulletHitFired) do
+			if type(t) ~= "number" or now - t > 4.0 then
+				State.clientBulletHitFired[uid] = nil
+			end
+		end
+	end
 	-- v19: pierceListCache TTL
 	if State.pierceListCache then
 		for k, e in pairs(State.pierceListCache) do
@@ -10722,10 +10817,57 @@ Bridge._resolveLocalPlayer    = resolveLocalPlayer
 --     Если имя + единица измерения и так всё говорят — сублейбла нет.
 -- ============================================================
 
-function Bridge.makeUiKit(ui)
+-- Реестры UI: владелец флага (детект коллизий) и биндинги для пост-load синка.
+Bridge._uiFlagOwners = Bridge._uiFlagOwners or {}
+Bridge._uiBindings   = Bridge._uiBindings   or {}
+
+-- ── Пост-load примирение конфига ───────────────────────────────────────────
+-- MacLib при LoadConfig дёргает Callback у Toggle/Slider/Dropdown, но у
+-- Colorpicker восстановление идёт через :SetColor, который Callback НЕ вызывает.
+-- Итог: свотч показывает сохранённый цвет, а CONFIG остаётся со старым — ровно
+-- то самое «некоторые функции сохраняются неправильно». Прогоняем один раз
+-- после каждого LoadConfig / LoadAutoLoadConfig.
+function Bridge.reconcileUiConfig(ML)
+	ML = ML or Bridge._uiMacLib
+	if not (ML and ML.Options) then return 0 end
+	local n = 0
+	for _, b in ipairs(Bridge._uiBindings) do
+		local el = ML.Options[b.flag]
+		if el and el.Class == b.class then
+			if pcall(b.apply, el) then n = n + 1 end
+		end
+	end
+	return n
+end
+
+function Bridge.makeUiKit(ui, ns)
 	local kit = {}
-	local flag = ui.flag or function(s) return "BRM5_" .. tostring(s) end
+	local baseFlag = ui.flag or function(s) return "BRM5_" .. tostring(s) end
 	local ML   = ui.MacLib
+	Bridge._uiMacLib = ML or Bridge._uiMacLib
+
+	-- Флаг обязателен: авто-генерация из Name давала коллизии между модулями
+	-- (два "Names"/"Enabled" в разных секциях → один флаг → второй элемент
+	-- вытеснял первый из MacLib.Options и первый переставал сохраняться).
+	local function flag(s)
+		if type(s) ~= "string" or s == "" then
+			warn("[UIKIT] пустой Flag — элемент не будет сохраняться корректно")
+			s = "unnamed"
+		end
+		local f = baseFlag(ns and (ns .. "_" .. s) or s)
+		local owner = Bridge._uiFlagOwners[f]
+		if owner then
+			warn(("[UIKIT] DUPLICATE FLAG %q: уже занят %s — один из них не сохранится")
+				:format(tostring(f), tostring(owner)))
+		end
+		Bridge._uiFlagOwners[f] = (ns or "?") .. ":" .. s
+		return f
+	end
+
+	local function bindOpt(f, class, applyFn)
+		Bridge._uiBindings[#Bridge._uiBindings + 1] =
+			{ flag = f, class = class, apply = applyFn }
+	end
 
 	-- ── Фабрики аксессоров ─────────────────────────────────────────────
 	--
@@ -10780,8 +10922,19 @@ function Bridge.makeUiKit(ui)
 	end
 	kit.notify = notify
 	function kit.ready()
-		task.defer(function() uiReady = true end)
+		task.defer(function()
+			-- Примирение ДО снятия глушилки тостов: LoadAutoLoadConfig лоадера
+			-- обычно идёт сразу после buildUI, поэтому на следующем кадре
+			-- значения уже восстановлены и можно добить тихие классы
+			-- (Colorpicker). Идемпотентно — повторный вызов безвреден.
+			pcall(Bridge.reconcileUiConfig, ML)
+			uiReady = true
+		end)
 	end
+	-- Явный ре-синк для лоадера: вызывать после ручного MacLib:LoadConfig(name).
+	-- Правильный порядок: Window → SetFolder → модули (load/start/buildUI) →
+	-- LoadAutoLoadConfig → Bridge.reconcileUiConfig(MacLib).
+	kit.reconcile = function() return Bridge.reconcileUiConfig(ML) end
 
 	-- Программно синхронизировать тоггл (например, когда фичу выключил
 	-- хоткей или сам модуль).
@@ -10800,12 +10953,24 @@ function Bridge.makeUiKit(ui)
 		local guard, togEl = false, nil
 		local function commit(val)
 			val = val and true or false
+			-- Обрыв эхо-петли по ЗНАЧЕНИЮ, а не только по guard: если MacLib
+			-- когда-нибудь начнёт откладывать Callback (task.defer), эхо придёт
+			-- уже после guard=false и commit зациклится сам на себя.
+			if val == (o.get() and true or false) then
+				if togEl then
+					guard = true
+					pcall(function() togEl:UpdateState(val) end)
+					guard = false
+				end
+				return
+			end
 			o.set(val)
 			notify(o.Title, val and "Enabled" or "Disabled")
 			guard = true
 			if togEl then pcall(function() togEl:UpdateState(val) end) end
 			guard = false
 		end
+		local fFeat = flag(o.Flag)
 		togEl = section:Toggle({
 			Name    = "Enabled",
 			Default = o.get(),
@@ -10813,7 +10978,10 @@ function Bridge.makeUiKit(ui)
 				if guard then return end   -- игнорируем эхо от UpdateState
 				commit(v)
 			end,
-		}, flag(o.Flag))
+		}, fFeat)
+		bindOpt(fFeat, "Toggle", function(el)
+			o.set(el.State and true or false)
+		end)
 		if o.Desc then section:SubLabel({ Text = o.Desc }) end
 		-- Кейбинд идёт сразу под фичей, которую включает, и без дефолтной
 		-- клавиши. MacLib сам рисует мобильный FAB для каждого Keybind —
@@ -10830,42 +10998,69 @@ function Bridge.makeUiKit(ui)
 				Toggle = function() commit(not o.get()) end,
 			})
 		end
-		return { commit = commit, element = togEl, flag = flag(o.Flag) }
+		return { commit = commit, element = togEl, flag = fFeat }
 	end
 
 	-- ── Вторичный тоггл: своё имя, одно уведомление ────────────────────
 	function kit.toggle(section, o)
 		local guard = false
-		local el = section:Toggle({
+		local f = flag(o.Flag or (o.Name:gsub("%s+", "") .. "_T"))
+		local el
+		el = section:Toggle({
 			Name = o.Name, Default = o.get(),
 			Callback = function(v)
 				if guard then return end
-				o.set(v and true or false)
-				notify(o.Title or o.Name, v and "Enabled" or "Disabled")
+				v = v and true or false
+				local changed = v ~= (o.get() and true or false)
+				o.set(v)
+				-- тост только на РЕАЛЬНОЕ изменение: программный UpdateState
+				-- (пресеты, syncToggle) больше не спамит уведомлениями
+				if changed then
+					notify(o.Title or o.Name, v and "Enabled" or "Disabled")
+				end
 				if o.after then pcall(o.after, v) end
 			end,
-		}, flag(o.Flag or (o.Name:gsub("%s+", "") .. "_T")))
+		}, f)
+		bindOpt(f, "Toggle", function(e)
+			local v = e.State and true or false
+			o.set(v)
+			if o.after then pcall(o.after, v) end
+		end)
 		if o.Desc then section:SubLabel({ Text = o.Desc }) end
-		return el
+		-- второй возврат: программный сет без тоста (guard настоящий, а не мёртвый)
+		return el, function(v)
+			v = v and true or false
+			guard = true
+			pcall(function() el:UpdateState(v) end)
+			guard = false
+			o.set(v)
+		end
 	end
 
 	-- ── Слайдер: НИКОГДА не уведомляет ─────────────────────────────────
 	-- Возвращает элемент, чтобы вызывающий мог дёргать :SetVisibility.
 	function kit.slider(section, o)
+		local f = flag(o.Flag)
 		local el = section:Slider({
-			Name = o.Name, Default = o.Default,
+			Name = o.Name,
+			Default = (o.get and o.get()) or o.Default,   -- живой дефолт, если дан get
 			Minimum = o.Min, Maximum = o.Max,
 			Precision = o.Precision or 0, Suffix = o.Suffix, Prefix = o.Prefix,
 			Callback = o.Callback,
-		}, flag(o.Flag))
+		}, f)
+		bindOpt(f, "Slider", function(e)
+			if o.Callback then pcall(o.Callback, e.Value) end
+		end)
 		if o.Desc then section:SubLabel({ Text = o.Desc }) end
 		return el
 	end
 
 	-- ── Дропдаун: уведомляет "Selected: X" ─────────────────────────────
 	function kit.dropdown(section, o)
+		local f = flag(o.Flag)
 		local el = section:Dropdown({
-			Name = o.Name, Options = o.Options, Default = o.Default,
+			Name = o.Name, Options = o.Options,
+			Default = (o.get and o.get()) or o.Default,
 			Multi = o.Multi, Search = o.Search, Required = o.Required,
 			Callback = function(v)
 				o.Callback(v)
@@ -10874,17 +11069,34 @@ function Bridge.makeUiKit(ui)
 				end
 				if o.after then pcall(o.after, v) end
 			end,
-		}, flag(o.Flag))
+		}, f)
+		bindOpt(f, "Dropdown", function(e)
+			pcall(o.Callback, e.Value)
+			if o.after then pcall(o.after, e.Value) end
+		end)
 		if o.Desc then section:SubLabel({ Text = o.Desc }) end
 		return el
 	end
 
 	-- ── Colorpicker: не уведомляет (как и слайдер) ─────────────────────
+	-- ГЛАВНЫЙ ФИКС КОНФИГА: LoadConfig восстанавливает цвет через :SetColor,
+	-- который Callback НЕ вызывает (в отличие от Toggle/Slider/Dropdown).
+	-- Без bindOpt все 24 колорпикера показывали сохранённый цвет, а игра
+	-- рисовала дефолтным. Синк добивает Bridge.reconcileUiConfig.
 	function kit.color(section, o)
-		return section:Colorpicker({
-			Name = o.Name, Default = o.Default, Alpha = o.Alpha,
+		local f = flag(o.Flag)
+		local el = section:Colorpicker({
+			Name = o.Name,
+			Default = (o.get and o.get()) or o.Default,
+			Alpha = o.Alpha,
 			Callback = o.Callback,
-		}, flag(o.Flag))
+		}, f)
+		bindOpt(f, "Colorpicker", function(e)
+			local c = e.Color
+			if c == nil and e.GetColor then c = e:GetColor() end
+			if c then pcall(o.Callback, c, e.Alpha) end
+		end)
+		return el
 	end
 
 	-- ── Кнопка: сообщает РЕЗУЛЬТАТ, включая причину неудачи ────────────
@@ -10901,7 +11113,8 @@ function Bridge.makeUiKit(ui)
 					end
 				end
 			end,
-		}, flag(o.Flag or (o.Name:gsub("%s+", "") .. "_B")))
+		})   -- без флага: Button не поддерживается системой конфигов, а флаг
+		     -- кнопки мог вытеснить из MacLib.Options реальный элемент
 	end
 
 	-- ── Группа: Divider + Header. Единственный способ разбивать секцию ──
@@ -10939,6 +11152,6 @@ local BRM5Lib = {
 	Bridge  = Bridge,
 	CONFIG  = CONFIG,
 	State   = State,
-	version = "BRM5Lib_v1",
+	version = "BRM5Lib_v21",
 }
 return BRM5Lib
