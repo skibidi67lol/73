@@ -1,4 +1,58 @@
 --[[
+	BRM5SilentAim_v23 — CHANGELOG от v22:
+
+	FIX SETTINGS WIPE (критично):
+	  installSilentAim заливал SA_CONFIG в CONFIG БЕЗУСЛОВНО — а зовётся он из
+	  respawn-пути и из hook-retry в Heartbeat (каждые ~4с пока хуки не встали).
+	  Каждый вызов сбрасывал SilentAim/FOV/звуки/трейсеры/предикт к дефолтам,
+	  UI при этом показывал старые значения. Теперь доливаются только
+	  НЕДОСТАЮЩИЕ ключи (как уже было сделано в start()).
+	  Плюс exponential backoff + кап попыток у hook-retry — тяжёлые GC-сканы
+	  не гоняются вечно, если хуки в этой сессии не встанут.
+
+	FIX FOV UNITS (селекция шире круга в 2-3 раза):
+	  Круг рисует slider как ПОЛНЫЙ конус (radiusPx = f*tan(FOV/2)), а все
+	  сравнения брали сырое значение как УГЛОВОЙ РАДИУС от оси камеры.
+	  Теперь все bounds идут через Bridge.getAimFovHalfDeg (с fallback для
+	  старой либы), дефолт FOV 120 → 60, slider Max 360 → 180, рисование
+	  круга клампится (<180°, tan не взрывается).
+
+	FIX SA БЕЗ ESP (не работал вообще):
+	  Единственный периодический фидер State.actors жил в ESP Heartbeat за
+	  гейтом CONFIG.ESP, а pruneAllCaches таблицу ещё и опустошал. Теперь
+	  aim-tick сам гонит tickRepSyncBatch/refreshActorSquads по общим стампам
+	  State.lastRepSyncBatch/lastSquadRefresh — без дублей при включённом ESP.
+
+	FEATURE TARGET BONE Random/Auto:
+	  Random — новая кость на каждый выстрел (реролл в markCombatDischarge,
+	  кэш на выстрел — не дрожит в per-frame resolve). Auto — Head вблизи,
+	  UpperTorso при дистанции/скорости/пинге/перекрытом Head
+	  (AutoBoneHeadMaxDist/MaxSpeed/MaxPing). Шадоу resolveAimBonePart —
+	  иначе hit-патчи искали FindFirstChild("Random") и молча падали в Head.
+
+	FEATURE HITCHANCE:
+	  CONFIG.HitChance (100 = выкл, ролл в markCombatDischarge). Промах НЕ
+	  скипает выстрел — уводит прицел вбок за габариты модели (плоско по
+	  вертикали) и глушит синтез попадания: scheduleForceBulletOp1,
+	  buildBulletForceHitSnapshot (nil), resolveForceHitArgs (nil),
+	  patchHitPartAndPos/patchBulletEventOp1/Op2 — пропускают как есть,
+	  applyForceHitOp2 в namecall — скип, v138 server patch — скип (иначе
+	  patchV138ServerAim пересчитал бы честную точку и затёр промах).
+
+	FIX LEAKS/CORRECTNESS:
+	  startAimThread — guard от двойного старта (утекал Heartbeat-коннект).
+	  stopAimThread — отключает hitFxConn/bulletLogConn/hitParticleDriver,
+	  уничтожает hitParticleSystems. resetAfterRespawn гейтится State.running.
+	  applyDischargeAim/patchHitPartAndPos — stale-цель отбрасывается по
+	  смерти (isActorDead) и возрасту (0.5s). sendConnHooks/receiveConnHooks —
+	  weak-keyed. ensureFovCircle/spawnHitParticles3D — truthy-check Drawing
+	  (userdata-исполнители). AimSkipDeadHP удалён (нигде не читался —
+	  dead-skip и так безусловный в либе). Debug HUD цикл останавливается
+	  по State.running. Aim-tick: тело в именованной функции, pcall(fn, dt) —
+	  без аллокации замыкания на кадр. FOV circle пишет Drawing-свойства
+	  только при изменении.
+]]
+--[[
 	BRM5SilentAim_v22 — CHANGELOG от v21:
 
 	FIX MELEE HANDS:
@@ -104,6 +158,49 @@ local function markCombatDischarge()
 	local S = saState()
 	S.lastDischargeAimTime = os.clock()
 	S.localDischargePending = true
+	-- v23: пер-выстрельная граница — реролл кости для Random/Auto
+	S.shotBoneReroll = true
+	-- v23 HitChance: ролл РОВНО ОДИН РАЗ на выстрел. 100 = фича выключена,
+	-- ноль оверхеда. Промах не скипает выстрел (палевно) — уводит точку.
+	local chance = tonumber(CONFIG.HitChance) or 100
+	if chance >= 100 or CONFIG.SilentAim ~= true then
+		S.shotMissPending = false
+		S.shotMissUntil = 0
+	else
+		S.shotMissPending = math.random(1, 100) > math.max(chance, 0)
+		S.shotMissUntil = S.shotMissPending and (os.clock() + 1.5) or 0
+	end
+end
+
+-- v23 HitChance: активен ли промах текущего выстрела (окно ~1.5s — burst
+-- и запоздавшие bullet-эвенты одного выстрела, дальше само гаснет).
+local function shotMissActive()
+	local S = saState()
+	return S.shotMissPending == true and os.clock() < (S.shotMissUntil or 0)
+end
+
+-- v23 HitChance: точка промаха — перпендикулярно линии выстрела, сразу за
+-- габаритами модели. Вертикаль почти не трогаем: боковой промах выглядит
+-- натуральнее, чем пуля над головой.
+local function computeShotMissPoint(origin, aimPt, target)
+	if typeof(origin) ~= "Vector3" or typeof(aimPt) ~= "Vector3" then return nil end
+	local dir = aimPt - origin
+	local flat = Vector3.new(dir.X, 0, dir.Z)
+	if flat.Magnitude < 0.05 then flat = Vector3.new(0, 0, -1) end
+	local perp = flat.Unit:Cross(Vector3.new(0, 1, 0))
+	if perp.Magnitude < 0.05 then perp = Vector3.new(1, 0, 0) end
+	perp = perp.Unit
+	local halfWidth = 2.2
+	local model = target and target.Parent
+	if model and model:IsA("Model") then
+		local ok, ext = pcall(model.GetExtentsSize, model)
+		if ok and typeof(ext) == "Vector3" then
+			halfWidth = math.max(math.max(ext.X, ext.Z) * 0.5, 1.2)
+		end
+	end
+	local side = math.random() < 0.5 and -1 or 1
+	local off = halfWidth + 0.7 + math.random() * 1.5
+	return aimPt + perp * (side * off) + Vector3.new(0, -math.random() * 0.6, 0)
 end
 
 -- Compat-шимы удалены: library.lua безусловно определяет isLocalPlayerShot,
@@ -133,13 +230,23 @@ local SA_CONFIG = {
 	ServerOnlyAimPatch = false,
 	ServerAimDebug = false,
 	SilentAim = false,           -- master OFF by default
-	SilentAimFOV = 120,
+	-- v23: слайдер хранит ПОЛНЫЙ конус; сравнения идут через half-angle
+	-- (Bridge.getAimFovHalfDeg). Было 120 — после фикса юнитов это конус
+	-- 240°, принимал цели вне экрана. 60 = разумный дефолт.
+	SilentAimFOV = 60,
+	-- v23 HitChance: процент попаданий. 100 = фича выключена (ноль оверхеда).
+	HitChance = 100,
 	FovCircle = true,            -- FOV v11: показывать FOV circle
 	FovCircleColor = Color3.fromRGB(255, 255, 255),
 	FovCircleThickness = 1,
 	FovCircleFilled = false,
 	FovCircleTransparency = 0.6, -- 0=непрозрачный, 1=невидимый
 	SilentAimBone = "Head",
+	-- v23 Auto bone: Head пока цель близко/медленно/пинг ок и Head не перекрыт,
+	-- иначе UpperTorso. Пороги:
+	AutoBoneHeadMaxDist = 180,   -- studs до головы
+	AutoBoneHeadMaxSpeed = 12,   -- горизонтальная скорость цели, studs/s
+	AutoBoneHeadMaxPing = 120,   -- ms
 	SilentAimTargetHostile = true,
 	SilentAimTargetPlayers = true,
 	SilentAimMaxDistance = 500,
@@ -175,7 +282,8 @@ local SA_CONFIG = {
 	ForceClientHit = true,
 	ForceHit = true,
 	IgnoreTeammates = true,
-	AimSkipDeadHP = true,
+	-- AimSkipDeadHP удалён v23: ключ нигде не читался — скип мёртвых и так
+	-- безусловный в библиотеке (isActorDead в selection). Тумблер снят из UI.
 	AimVisuals = true,
 	ShotTracers = true,
 	TracerDuration = 1.4,
@@ -269,6 +377,15 @@ for k, v in pairs(SA_CONFIG) do
 end
 local CONFIG = Lib.CONFIG
 
+-- v23 FOV UNITS: слайдер = ПОЛНЫЙ конус, все сравнения — угловой РАДИУС от
+-- оси камеры. Единая точка конверсии; guard — вдруг библиотека старее.
+local function aimFovHalfDeg()
+	if type(Bridge.getAimFovHalfDeg) == "function" then
+		return Bridge.getAimFovHalfDeg()
+	end
+	return math.clamp(CONFIG.SilentAimFOV or 120, 1, 360) * 0.5
+end
+
 
 function Bridge.isSilentAimTargetClass(class)
 	if class == "self" then return false end
@@ -287,12 +404,135 @@ function Bridge.isSilentAimTargetClass(class)
 	return class ~= "npc_friendly"
 end
 
+-- v23 TARGET BONE Random/Auto: имя кости для конкретной модели/выстрела.
+-- Статические режимы возвращаются как есть. Random/Auto считаются ОДИН РАЗ
+-- на выстрел (кэш по mode+uid, реролл только по State.shotBoneReroll из
+-- markCombatDischarge) — кость стабильна внутри выстрела/очереди и не
+-- дрожит в per-frame resolve.
+local DYNAMIC_BONE_POOL = { "Head", "UpperTorso", "LowerTorso" }
+local function resolveDynamicBoneName(model, uid, origin)
+	local mode = CONFIG.SilentAimBone or "Head"
+	if mode ~= "Random" and mode ~= "Auto" then
+		return mode
+	end
+	local S = saState()
+	local cache = S.shotBoneCache
+	if type(cache) ~= "table" then
+		cache = {}
+		S.shotBoneCache = cache
+	end
+	if S.shotBoneReroll then
+		table.clear(cache)
+		S.shotBoneReroll = false
+	end
+	local key = mode .. "|" .. tostring(uid or model)
+	local cached = cache[key]
+	if cached then return cached end
+	local choice = "Head"
+	if mode == "Random" then
+		local pool = {}
+		for _, name in ipairs(DYNAMIC_BONE_POOL) do
+			local p = model and model:FindFirstChild(name)
+			if p and p:IsA("BasePart") then
+				pool[#pool + 1] = name
+			end
+		end
+		if #pool > 0 then
+			choice = pool[math.random(1, #pool)]
+		end
+	else -- Auto: Head близко/медленно/пинг ок/Head открыт, иначе UpperTorso
+		local head = model and model:FindFirstChild("Head")
+		if not (head and head:IsA("BasePart")) then
+			choice = "UpperTorso"
+		else
+			local from = typeof(origin) == "Vector3" and origin
+				or Bridge.getAimLosOrigin(nil)
+			local useTorso = false
+			if typeof(from) == "Vector3"
+				and (head.Position - from).Magnitude > (CONFIG.AutoBoneHeadMaxDist or 180) then
+				useTorso = true
+			end
+			if not useTorso and type(Bridge.getActorRootVelocity) == "function" then
+				local vel = Bridge.getActorRootVelocity(head, type(uid) == "string" and uid or nil)
+				if typeof(vel) == "Vector3"
+					and Vector3.new(vel.X, 0, vel.Z).Magnitude > (CONFIG.AutoBoneHeadMaxSpeed or 12) then
+					useTorso = true
+				end
+			end
+			if not useTorso and type(Bridge.getNetworkPingMs) == "function"
+				and Bridge.getNetworkPingMs() > (CONFIG.AutoBoneHeadMaxPing or 120) then
+				useTorso = true
+			end
+			if not useTorso and typeof(from) == "Vector3"
+				and type(Bridge.hasClearShotToPoint) == "function"
+				and not Bridge.hasClearShotToPoint(from, head.Position, head, false) then
+				useTorso = true
+			end
+			choice = useTorso and "UpperTorso" or "Head"
+		end
+	end
+	-- выбранная кость обязана существовать: fallback Head → UpperTorso
+	if model then
+		local p = model:FindFirstChild(choice)
+		if not (p and p:IsA("BasePart")) then
+			p = model:FindFirstChild("Head")
+			if p and p:IsA("BasePart") then
+				choice = "Head"
+			else
+				choice = "UpperTorso"
+			end
+		end
+	end
+	cache[key] = choice
+	return choice
+end
+
 function Bridge.getSilentAimPart(data)
 	if not data or not data.model or not data.model.Parent then return nil end
-	local bone = CONFIG.SilentAimBone or "Head"
+	local bone = resolveDynamicBoneName(data.model, data.uid, nil)
 	local part = data.model:FindFirstChild(bone)
 	if part and part:IsA("BasePart") then return part end
 	return data.root
+end
+
+-- v23: шадоу библиотечной версии (паттерн как у getSilentAimTarget ниже).
+-- Библиотечная читает CONFIG.SilentAimBone verbatim — для Random/Auto это
+-- FindFirstChild("Random") → nil → молчаливый откат в Head на hit-патчах,
+-- расходящийся с точкой прицеливания.
+function Bridge.resolveAimBonePart(model, fallbackPart)
+	if typeof(model) ~= "Instance" or not model:IsA("Model") then
+		return fallbackPart
+	end
+	local uid = nil
+	pcall(function()
+		uid = (fallbackPart and fallbackPart:GetAttribute("ActorUID"))
+			or model:GetAttribute("ActorUID")
+	end)
+	local boneName = resolveDynamicBoneName(model, uid, nil)
+	local bone = model:FindFirstChild(boneName)
+	if bone and bone:IsA("BasePart") then return bone end
+	return Bridge.getHeadPart(model, fallbackPart)
+end
+
+-- v23 HitChance: снапшот force-hit не строится для промахнутого выстрела —
+-- это главный источник синтетических попаданий (payload._brm5Fh + pending).
+-- Заодно чиним boneName снапшота для Random/Auto (актор-хук делает
+-- FindFirstChild(fh.boneName) на модели жертвы).
+local origBuildBulletForceHitSnapshot = Bridge.buildBulletForceHitSnapshot
+Bridge.buildBulletForceHitSnapshot = function(origin, uid)
+	if shotMissActive() then return nil end
+	if type(uid) == "string" and type(Bridge.getPendingBulletShot) == "function" then
+		local pending = Bridge.getPendingBulletShot(uid)
+		if pending and pending.brm5Missed then return nil end
+	end
+	local snap = origBuildBulletForceHitSnapshot(origin, uid)
+	if type(snap) == "table" and snap.aimPart and snap.aimPart.Parent then
+		local mode = CONFIG.SilentAimBone
+		if mode == "Random" or mode == "Auto" then
+			snap.boneName = snap.aimPart.Name
+		end
+	end
+	return snap
 end
 
 -- Дубль удалён: та же математика, что в library.lua, но БЕЗ проверки cam
@@ -498,7 +738,9 @@ Bridge.prepareSilentAimShot = function(originCFrame)
 	end
 	State.shotAimTarget = target
 	State.shotAimTargetTime = os.clock()
-	if Bridge.needsServerAimPatch() then
+	-- v23 HitChance: при промахе серверную точку не пересчитываем — она
+	-- перезаписала бы State честной точкой поверх miss
+	if Bridge.needsServerAimPatch() and not shotMissActive() then
 		Bridge.prepareServerAimShot(originCFrame.Position, target)
 	end
 	local aimLook = State.forceHitPoint or State.aimAimPoint
@@ -514,6 +756,10 @@ Bridge.prepareSilentAimShot = function(originCFrame)
 end
 
 function Bridge.patchHitPartAndPos(hitPos, part, originPos)
+	-- v23 HitChance: промах — событие уходит нетронутым, никаких редиректов
+	if shotMissActive() then
+		return hitPos, part
+	end
 	if part and Bridge.isEnemyHitPart(part) then
 		local nh, np = Bridge.redirectEnemyHitToAimBone(hitPos, part, originPos, nil)
 		return nh, np
@@ -523,7 +769,13 @@ function Bridge.patchHitPartAndPos(hitPos, part, originPos)
 	if not patchClient then
 		return hitPos, part
 	end
-	local target = S.shotAimTarget or S.aimTargetPart
+	-- v23: shotAimTarget без границы свежести патчил хиты по цели ДАВНЕГО
+	-- выстрела — теперь протухшая (>0.5s) отбрасывается.
+	local target = S.shotAimTarget
+	if target and os.clock() - (S.shotAimTargetTime or 0) > 0.5 then
+		target = nil
+	end
+	target = target or S.aimTargetPart
 	if (not target or not target.Parent) and typeof(originPos) == "Vector3" then
 		target = Bridge.getCombatAimTarget(originPos, false)
 	end
@@ -546,6 +798,20 @@ function Bridge.patchHitPartAndPos(hitPos, part, originPos)
 	return aimPos, bonePart or target
 end
 
+-- v23 HitChance: подмена точки прицеливания промахом (одна на выстрел).
+-- Пишем ВСЕ ТРИ точки — shotBurstAimPoint читает getLockedShotAimPoint
+-- (залоченный burst), иначе очередь доцелилась бы обратно.
+local function applyShotMissAim(originPos, target, aimPt)
+	if not shotMissActive() then return aimPt end
+	if not (target and target.Parent) or typeof(aimPt) ~= "Vector3" then return aimPt end
+	local miss = computeShotMissPoint(originPos, aimPt, target)
+	if typeof(miss) ~= "Vector3" then return aimPt end
+	State.forceHitPoint = miss
+	State.aimAimPoint = miss
+	State.shotBurstAimPoint = miss
+	return miss
+end
+
 local function applyDischargeAim(originCFrame)
 	if typeof(originCFrame) ~= "CFrame" then
 		return originCFrame
@@ -554,7 +820,11 @@ local function applyDischargeAim(originCFrame)
 	local target = State.shotAimTarget
 	local aimPt = State.forceHitPoint or State.aimAimPoint
 	if target and target.Parent and typeof(aimPt) == "Vector3"
-		and now - (State.shotAimTargetTime or 0) < 0.15 then
+		and now - (State.shotAimTargetTime or 0) < 0.15
+		-- v23: труп не принимаем даже свежим — уходим в re-resolve ветку
+		and not Bridge.isActorDead(State.actors and State.aimTargetUid
+			and State.actors[State.aimTargetUid] or nil) then
+		aimPt = applyShotMissAim(originCFrame.Position, target, aimPt)
 		if Bridge.shouldRetargetClientMuzzle() then
 			originCFrame = Bridge.retargetOriginCFrame(originCFrame, target, aimPt)
 		end
@@ -565,6 +835,7 @@ local function applyDischargeAim(originCFrame)
 		end
 		target = State.shotAimTarget
 		aimPt = State.forceHitPoint or State.aimAimPoint
+		aimPt = applyShotMissAim(originCFrame.Position, target, aimPt)
 		if target and target.Parent and typeof(aimPt) == "Vector3"
 			and Bridge.shouldRetargetClientMuzzle() then
 			originCFrame = Bridge.retargetOriginCFrame(originCFrame, target, aimPt)
@@ -584,6 +855,10 @@ function Bridge.patchBulletEventOp2(originPos, hitPos, part, normal, isLocal)
 	end
 	local isLocalShot = isLocal == true
 	if not isLocalShot then
+		return originPos, hitPos, part, normal, false
+	end
+	-- v23 HitChance: промах — эвент как есть, force-флаг false
+	if shotMissActive() then
 		return originPos, hitPos, part, normal, false
 	end
 	if part and Bridge.isEnemyHitPart(part) then
@@ -729,7 +1004,10 @@ end
 
 local function ensureFovCircle()
 	if State.fovCircle then return end
-	if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then return end
+	-- v23: truthy-check как у остального файла — на исполнителях, где Drawing
+	-- это userdata, `type(Drawing) == "table"` молча прятал круг навсегда
+	if not Drawing or type(Drawing.new) ~= "function" then return end
+	State.fovCircleProps = nil -- сброс кэша последних записанных свойств
 	local c = Drawing.new("Circle")
 	c.NumSides    = 64
 	c.Thickness   = CONFIG.FovCircleThickness or 1
@@ -976,7 +1254,8 @@ end
 
 function Bridge.spawnHitParticles3D(hitPos, normal)
 	if CONFIG.HitParticles == false or typeof(hitPos) ~= "Vector3" then return end
-	if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then return end
+	-- v23: тот же userdata-Drawing фикс, что и в ensureFovCircle
+	if not Drawing or type(Drawing.new) ~= "function" then return end
 	State.hitParticleSystems = State.hitParticleSystems or {}
 	local maxSys = CONFIG.HitParticleMaxSystems or 5
 	while #State.hitParticleSystems >= maxSys do
@@ -1186,6 +1465,11 @@ end
 
 function Bridge.patchNetworkDischargeArgs(args, fromIndex)
 	if type(args) ~= "table" or not Bridge.needsServerAimPatch() then return false end
+	-- v23 HitChance: промах — v138 не трогаем. patchV138ServerAim пересчитал
+	-- бы СВЕЖУЮ честную точку (computeFreshShotAimPoint) и затёр miss в State,
+	-- а серверный выстрел полетел бы в цель. Оригинальный v138 уже смотрит в
+	-- точку промаха (muzzle перенацелен в Discharge-хуке).
+	if shotMissActive() then return false end
 	local route, action = args[fromIndex], args[fromIndex + 1]
 	if route ~= "InventoryAction" or action ~= "Discharge" then return false end
 	local v138 = args[fromIndex + 2]
@@ -1214,7 +1498,8 @@ function Bridge.classifyAimVisibility(losOrigin, part, aimPoint, model)
 	end
 	if CONFIG.ResolverLite ~= false and model and model:IsA("Model") then
 		local muzzle = Bridge.getAimLosOrigin(losOrigin)
-		local expPart = Bridge.resolveResolverLite(muzzle, model, nil, getCamera(), CONFIG.SilentAimFOV)
+		-- v23 FOV UNITS: bound = половина конуса, не сырой слайдер
+		local expPart = Bridge.resolveResolverLite(muzzle, model, nil, getCamera(), aimFovHalfDeg())
 		if expPart then return 1 end
 	end
 	return 3
@@ -2194,7 +2479,8 @@ Bridge.updateAimVisuals = function()
 		return
 	end
 
-	local maxAngle = CONFIG.SilentAimFOV or 15
+	-- v23 FOV UNITS: сравнение углового радиуса — половина конуса слайдера
+	local maxAngle = aimFovHalfDeg()
 
 	local refreshIv = CONFIG.AimVisualInterval or 0.08
 	if now - (State.lastAimVizTargetRefresh or 0) >= refreshIv then
@@ -2446,7 +2732,8 @@ Bridge.tryAimPatch = function(originCFrame, payload, isLocalShot)
 	end
 	if not target then return originCFrame, false end
 
-	if Bridge.needsServerAimPatch() then
+	-- v23 HitChance: см. prepareSilentAimShot — не затираем miss честной точкой
+	if Bridge.needsServerAimPatch() and not shotMissActive() then
 		Bridge.prepareServerAimShot(originPos, target)
 	end
 
@@ -2659,7 +2946,9 @@ function Bridge.hookBulletSendEventCallback(send)
 	if State.sendEventHooked or not send then return false end
 	if type(getconnections) ~= "function" then return false end
 	if type(State.sendConnHooks) ~= "table" then
-		State.sendConnHooks = {}
+		-- v23: weak keys — таблица ключуется connection-объектами и никогда
+		-- не чистилась, мёртвые коннекты копились до конца сессии
+		State.sendConnHooks = setmetatable({}, { __mode = "k" })
 	end
 
 	local okList, conns = pcall(getconnections, send.Event)
@@ -2747,6 +3036,16 @@ end
 function Bridge.patchBulletEventOp1(uid, replicate, hitPos, part, normal, material, timeOff)
 	if not (CONFIG.SilentAim or Bridge.shouldForceClientHit()) then
 		return uid, replicate, hitPos, part, normal, material, timeOff, false
+	end
+	-- v23 HitChance: промахнутый выстрел (по uid или активному окну) — как есть
+	if shotMissActive() then
+		return uid, replicate, hitPos, part, normal, material, timeOff, false
+	end
+	if type(uid) == "string" then
+		local pendingShot = Bridge.getPendingBulletShot(uid)
+		if pendingShot and pendingShot.brm5Missed then
+			return uid, replicate, hitPos, part, normal, material, timeOff, false
+		end
 	end
 	if State.inOurBulletOp1Fire == uid then
 		if part and Bridge.isEnemyHitPart(part) then
@@ -2976,7 +3275,8 @@ function Bridge.installNamecallHooks()
 
 			-- 5. Patch logic is wrapped: any error here MUST NOT prevent the original call
 			local success, result = pcall(function()
-				if method == "FireServer" and Bridge.needsServerAimPatch() then
+				-- v23 HitChance: при промахе v138 не патчим (см. patchNetworkDischargeArgs)
+				if method == "FireServer" and Bridge.needsServerAimPatch() and not shotMissActive() then
 					for i = 2, args.n - 2 do
 						if args[i] == "InventoryAction" and args[i + 1] == "Discharge" and type(args[i + 2]) == "table" then
 							local origin
@@ -3002,6 +3302,7 @@ function Bridge.installNamecallHooks()
 							local caliber = args[8]
 							local isLocal = args[9]
 							if Bridge.shouldForceClientHit()
+								and not shotMissActive() -- v23 HitChance: промах не синтезируем
 								and (not part or not Bridge.isEnemyHitPart(part))
 								and isLocal == true then
 								local fOrigin, fHit, fPart, fNormal, fMat, fCal = Bridge.applyForceHitOp2(
@@ -3141,7 +3442,8 @@ function Bridge.hookReceiveEventConnections(recv)
 	if not recv or not recv:IsA("BindableEvent") then return false end
 	local okList, conns = pcall(getconnections, recv.Event)
 	if not okList or type(conns) ~= "table" then return false end
-	State.receiveConnHooks = State.receiveConnHooks or {}
+	-- v23: weak keys — та же утечка connection-ключей, что и в sendConnHooks
+	State.receiveConnHooks = State.receiveConnHooks or setmetatable({}, { __mode = "k" })
 	local hookedAny = false
 	for _, conn in ipairs(conns) do
 		if State.receiveConnHooks[conn] then continue end
@@ -3237,8 +3539,17 @@ function Bridge.hookBulletDischarge()
 			aimPt = State.forceHitPoint or State.aimAimPoint
 		end
 		Bridge.storePendingBulletShot(shotUid, target, aimPart, aimPt, muzzlePos, caliber, replicate)
+		-- v23 HitChance: помечаем pending промахом (снапшот уже nil — обёртка
+		-- buildBulletForceHitSnapshot) и не синтезируем op1-попадание
+		if shotMissActive() then
+			local pendingShot = Bridge.getPendingBulletShot(shotUid)
+			if pendingShot then
+				pendingShot.brm5Missed = true
+				pendingShot.forceHitSnapshot = nil
+			end
+		end
 		Bridge.spawnDischargeTracer(shotUid, muzzlePos, aimPt)
-		if Bridge.shouldForceClientHit() then
+		if Bridge.shouldForceClientHit() and not shotMissActive() then
 			Bridge.scheduleForceBulletOp1(shotUid, muzzlePos, aimPt, caliber, replicate)
 		end
 	end
@@ -3320,8 +3631,13 @@ end
 
 function Bridge.installSilentAim()
 	brm5Global().State = State
+	-- FIX v23 (главная причина «настройки сбрасываются»): здесь SA_CONFIG
+	-- заливался БЕЗУСЛОВНО, а installSilentAim зовётся из respawn-пути и из
+	-- hook-retry аим-тика (каждые ~4с пока хуки не встали) — каждый вызов
+	-- возвращал SilentAim/FOV/звуки/трейсеры к дефолтам, UI показывал старое.
+	-- Доливаем только НЕДОСТАЮЩИЕ ключи (как уже сделано в start()).
 	for k, v in pairs(SA_CONFIG) do
-		Lib.CONFIG[k] = v
+		if Lib.CONFIG[k] == nil then Lib.CONFIG[k] = v end
 	end
 
 	local hooked = false
@@ -3515,6 +3831,14 @@ end
 
 function Bridge.resolveForceHitArgs(bullet, pending)
 	if not bullet then return nil end
+	-- v23 HitChance: resolveForceHitPayload умеет собирать попадание и БЕЗ
+	-- снапшота (fallback на State) — режем промахнутый выстрел здесь, это
+	-- общий вход _multithreadSend-хуков и injectForceHitOp2OnBullet.
+	local p = pending
+	if not p and type(bullet._uid) == "string" then
+		p = Bridge.getPendingBulletShot(bullet._uid)
+	end
+	if (p and p.brm5Missed) or shotMissActive() then return nil end
 	local payload = Bridge.resolveForceHitPayload(
 		bullet._uid,
 		bullet._originCFrame and bullet._originCFrame.Position,
@@ -4171,6 +4495,9 @@ local tickFullAutoAssist = function()
 end
 
 local function resetAfterRespawn()
+	-- v23: после stop() синхронная половина колбэка всё равно отрабатывала
+	-- (lifecycle-коннект живёт в библиотеке) — гейтимся по State.running
+	if not State.running then return end
 	State.localPlayerAlive = true
 	State.playerInventory = nil
 	State.changeHookOwner = nil
@@ -4263,15 +4590,19 @@ end
 -- ============================================================
 local aimConn
 local function startAimThread()
+	-- v23: guard от двойного старта — повторный вызов затирал aimConn, и
+	-- старый Heartbeat-коннект утекал навсегда (у ESP такой guard был, у SA нет)
+	if aimConn then return end
 	local lastHookRetry = 0
+	local hookRetryCount = 0
 	-- FIX v12: создаём FOV circle при старте thread (не при хите)
 	ensureFovCircle()
 	-- ГЛАВНЫЙ aim-tick, 60fps. САМЫЙ горячий путь набора. Под Luraph ОБЯЗАН
 	-- быть нативным (LPH_NO_VIRTUALIZE — захватывает upvalues, поэтому НЕ JIT_MAX):
 	-- виртуализированный per-frame проход по раздутому GC = прогрессирующий фриз.
-	aimConn = game:GetService("RunService").Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
-		if not State.running then return end
-		local ok, err = pcall(function()
+	-- v23 PERF: тело тика — именованная функция, pcall(aimTickBody, dt) вместо
+	-- pcall(function() ... end) с захватом dt — без аллокации замыкания на кадр.
+	local aimTickBody = LPH_NO_VIRTUALIZE(function(dt)
 		local t = os.clock()
 		local combatActive = Bridge.combatAimActive()
 
@@ -4279,6 +4610,27 @@ local function startAimThread()
 			Bridge.pruneAllCaches(t)
 			if type(Bridge.prunePendingBulletShots) == "function" then
 				Bridge.prunePendingBulletShots(t)
+			end
+		end
+
+		-- Actor sync self-drive: без ESP таблицу State.actors никто не пополняет
+		-- (единственный периодический драйвер жил в ESP Heartbeat за гейтом
+		-- CONFIG.ESP), а pruneAllCaches её ещё и опустошает — SilentAim умирал
+		-- насовсем. Общие стампы исключают дубли с ESP, когда тот включён.
+		if CONFIG.SilentAim or mpActive() or Bridge.shouldForceClientHit() then
+			if t - (State.lastRepSyncBatch or 0) >= (CONFIG.RepSyncMinInterval or 0.35) then
+				State.lastRepSyncBatch = t
+				if type(Bridge.tickRepSyncBatch) == "function" then
+					pcall(Bridge.tickRepSyncBatch, CONFIG.ActorSyncBatchSize or 12)
+				end
+			end
+			if t - (State.lastSquadRefresh or 0) >= (CONFIG.SquadRefreshInterval or 3.0) then
+				-- стамп НЕ проставляем сами: refreshActorSquads пишет этот же
+				-- общий State.lastSquadRefresh внутри (и рано выходит, если он
+				-- свежий) — предзапись превратила бы вызов в no-op
+				if type(Bridge.refreshActorSquads) == "function" then
+					pcall(Bridge.refreshActorSquads)
+				end
 			end
 		end
 
@@ -4309,17 +4661,22 @@ local function startAimThread()
 			Bridge.applyWeaponModify(false)
 		end
 
-		-- Hook retry (не каждый кадр — раз в 4с)
+		-- Hook retry. v23: экспоненциальный backoff + кап попыток — раньше
+		-- installSilentAim (тяжёлые GC-сканы) гонялся каждые ~4с ВЕЧНО, если
+		-- хуки в этой сессии встать не могут. Счётчик сбрасывается, как
+		-- только всё установилось (или ретрай стал не нужен).
 		local hooksReady = State.namecallHooked and State.networkDischargeHooked
 			and State.bulletEventHooked
 			and (State.namecallHookVer or 0) >= 18
-		if not hooksReady and t - lastHookRetry >= (State.hookGcCooldown or 4) then
-			lastHookRetry = t
-			Bridge.installSilentAim()
-		elseif combatActive
-			and (not State.firearmHooked or not State.networkDischargeHooked) then
-			if t - lastHookRetry >= (State.hookGcCooldown or 4) then
+		local wantHookRetry = (not hooksReady)
+			or (combatActive and (not State.firearmHooked or not State.networkDischargeHooked))
+		if not wantHookRetry then
+			hookRetryCount = 0
+		elseif hookRetryCount < 10 then
+			local retryDelay = math.min((State.hookGcCooldown or 4) * (2 ^ hookRetryCount), 60)
+			if t - lastHookRetry >= retryDelay then
 				lastHookRetry = t
+				hookRetryCount += 1
 				Bridge.installSilentAim()
 			end
 		end
@@ -4375,28 +4732,66 @@ local function startAimThread()
 					local cam = workspace.CurrentCamera
 					local vp  = cam and cam.ViewportSize
 					if vp and vp.X > 0 and vp.Y > 0 then
-						local fovDeg = CONFIG.SilentAimFOV or 15
+						-- Проекция ПОЛНОГО конуса слайдера в пиксельный радиус —
+						-- half-angle, теперь совпадает с selection-bound'ами.
+						-- v23: кламп <180° — на старых сохранённых конфигах (до 360)
+						-- tan(>=90°) схлопывал круг в 1px точку.
+						local fovDeg = math.clamp(CONFIG.SilentAimFOV or 15, 1, 179)
 						local halfFov = math.rad(fovDeg * 0.5)
 						local focalLen = (vp.Y * 0.5) / math.tan(math.rad((cam.FieldOfView or 70) * 0.5))
 						local radiusPx = math.tan(halfFov) * focalLen
-						fc.Position    = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
-						fc.Radius      = math.max(radiusPx, 1)
-						fc.Color       = CONFIG.FovCircleColor or Color3.fromRGB(255, 255, 255)
+						-- v23 PERF: ~8 Drawing-свойств писались КАЖДЫЙ Heartbeat даже
+						-- без изменений — кэшируем последнее записанное, пишем по дельте.
+						local fp = State.fovCircleProps
+						if not fp then
+							fp = {}
+							State.fovCircleProps = fp
+						end
+						local px, py = vp.X * 0.5, vp.Y * 0.5
+						if fp.px ~= px or fp.py ~= py then
+							fp.px, fp.py = px, py
+							fc.Position = Vector2.new(px, py)
+						end
+						local radius = math.max(radiusPx, 1)
+						if fp.radius ~= radius then
+							fp.radius = radius
+							fc.Radius = radius
+						end
+						local col = CONFIG.FovCircleColor or Color3.fromRGB(255, 255, 255)
+						if fp.col ~= col then
+							fp.col = col
+							fc.Color = col
+						end
 						-- FIX: Thickness и Filled выставлялись ТОЛЬКО при создании
 						-- круга (ensureFovCircle) и потом не обновлялись — ползунок
 						-- толщины и тумблер Filled в UI не делали ничего.
-						fc.Thickness   = CONFIG.FovCircleThickness or 1
-						fc.Filled      = CONFIG.FovCircleFilled == true
+						local thick = CONFIG.FovCircleThickness or 1
+						if fp.thick ~= thick then
+							fp.thick = thick
+							fc.Thickness = thick
+						end
+						local filled = CONFIG.FovCircleFilled == true
+						if fp.filled ~= filled then
+							fp.filled = filled
+							fc.Filled = filled
+						end
 						-- FIX: у Potassium Transparency ИНВЕРТИРОВАН (1 = видимо).
 						-- Тут писалось сырое значение конфига, поэтому ползунок
 						-- «Transparency» работал наоборот: 0% давал невидимый круг,
 						-- 100% — полностью непрозрачный. Идём через showDrawing.
-						Bridge.showDrawing(fc, 1 - (CONFIG.FovCircleTransparency or 0.5))
+						local alpha = 1 - (CONFIG.FovCircleTransparency or 0.5)
+						if fp.alpha ~= alpha or fp.vis ~= true then
+							fp.alpha = alpha
+							fp.vis = true
+							Bridge.showDrawing(fc, alpha)
+						end
 					else
 						fc.Visible = false
+						if State.fovCircleProps then State.fovCircleProps.vis = false end
 					end
 				else
 					fc.Visible = false
+					if State.fovCircleProps then State.fovCircleProps.vis = false end
 				end
 			end
 		end
@@ -4405,8 +4800,10 @@ local function startAimThread()
 		if CONFIG.ShotTracers then
 			Bridge.updateShotTracers()
 		end
-
-		end)
+	end)
+	aimConn = game:GetService("RunService").Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
+		if not State.running then return end
+		local ok, err = pcall(aimTickBody, dt)
 		if not ok then
 			log("ERR", "SilentAim heartbeat", tostring(err))
 		end
@@ -4415,12 +4812,33 @@ end
 
 local function stopAimThread()
 	if aimConn then aimConn:Disconnect(); aimConn = nil end
+	-- v23: раньше утекали — hitFx/bulletLog коннекты, драйвер и системы
+	-- частиц продолжали жить (и рисовать) после stop()
+	if State.hitFxConn then
+		pcall(function() State.hitFxConn:Disconnect() end)
+		State.hitFxConn = nil
+	end
+	if State.bulletLogConn then
+		pcall(function() State.bulletLogConn:Disconnect() end)
+		State.bulletLogConn = nil
+	end
+	if State.hitParticleDriver then
+		pcall(function() State.hitParticleDriver:Disconnect() end)
+		State.hitParticleDriver = nil
+	end
+	if State.hitParticleSystems then
+		for _, sys in ipairs(State.hitParticleSystems) do
+			pcall(destroyParticleSystem, sys)
+		end
+		table.clear(State.hitParticleSystems)
+	end
 	Bridge.clearAimVisuals()
 	-- FIX v11: cleanup FOV circle
 	if State.fovCircle then
 		Bridge.destroyDrawing(State.fovCircle)
 		State.fovCircle = nil
 	end
+	State.fovCircleProps = nil
 end
 
 local SilentAim = {
@@ -4494,18 +4912,25 @@ function SilentAim.buildUI(ui)
 			set = function(v) CONFIG.SilentAim = v end,
 			Desc = "ur shots land on the best target in the fov\nbind works on PC + mobile",
 		})
+		-- v23: Max 360 → 180. Слайдер = ПОЛНЫЙ конус, сравнения — половина;
+		-- выше 180 круг вырождался (tan >= 90°) и принимал цели за спиной.
 		K.slider(L, { Name = "FOV", Flag = "FOV", Default = CONFIG.SilentAimFOV,
-			Min = 10, Max = 360, Suffix = "°",
+			Min = 10, Max = 180, Suffix = "°",
 			Callback = function(v) CONFIG.SilentAimFOV = v end,
-			Desc = "360 = anyone on screen" })
+			Desc = "matches the circle, 180 = whole screen" })
+		K.slider(L, { Name = "Hit Chance", Flag = "HitChance", Default = CONFIG.HitChance,
+			Min = 0, Max = 100, Suffix = "%",
+			Callback = function(v) CONFIG.HitChance = v end,
+			Desc = "rolls per shot, misses look natural" })
 		K.slider(L, { Name = "Max Distance", Flag = "MaxDist", Default = CONFIG.SilentAimMaxDistance,
 			Min = 50, Max = 2000, Suffix = " st",
 			Callback = function(v) CONFIG.SilentAimMaxDistance = v end })
 		K.dropdown(L, {
 			Name = "Target Bone", Flag = "Bone",
-			Options = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart" },
+			Options = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart", "Random", "Auto" },
 			Default = CONFIG.SilentAimBone or "Head",
 			Callback = function(v) CONFIG.SilentAimBone = v end,
+			Desc = "random = new bone every shot\nauto = head close, torso far/fast/laggy",
 		})
 		K.toggle(L, { Name = "Force Zero Spread", Flag = "ZeroSpread", Title = "Zero Spread",
 			get = function() return CONFIG.ForceZeroSpread end,
@@ -4536,9 +4961,8 @@ function SilentAim.buildUI(ui)
 		K.toggle(L, { Name = "Ignore Teammates", Flag = "IgnoreTeammates", Title = "Ignore Teammates",
 			get = function() return CONFIG.IgnoreTeammates end,
 			set = function(v) CONFIG.IgnoreTeammates = v end })
-		K.toggle(L, { Name = "Skip Dead", Flag = "SkipDead", Title = "Skip Dead",
-			get = function() return CONFIG.AimSkipDeadHP end,
-			set = function(v) CONFIG.AimSkipDeadHP = v end })
+		-- Тумблер "Skip Dead" удалён v23: CONFIG.AimSkipDeadHP нигде не
+		-- читался — скип мёртвых безусловный в библиотеке, галочка врала.
 
 		-- ═══ RIGHT: точность ═══════════════════════════════════════════
 		local R = tabSA:Section({ Side = "Right" })
@@ -4938,6 +5362,8 @@ function SilentAim.buildUI(ui)
 		local gmStat = D:Label({ Text = "Components: -" })
 		task.spawn(function()
 			while gmStat and gmStat._frame and gmStat._frame.Parent do
+				-- v23: после stop() цикл гонял collectFirearmComponents вечно
+				if not State.running then break end
 				pcall(function()
 					local comps = Bridge.collectFirearmComponents and Bridge.collectFirearmComponents() or {}
 					local h, r = 0, 0
