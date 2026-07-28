@@ -1,3 +1,59 @@
+-- movement v2 | fwd-ref fix | net-restore fix | camera-pass lean | leak cleanup
+--[[
+    movement v2 — CHANGELOG:
+
+    1) [КРИТИЧНО, fwd-ref] currentZoomMax читал ГЛОБАЛЬНЫЙ camCache (всегда nil,
+       zoom-лимит падал на ThirdPersonMax вместо реального _zoomLimit), а хук
+       Update контроллера сравнивал self с ГЛОБАЛЬНЫМ ctrlCache (nil, каждый
+       физ-кадр): локалы объявлялись НИЖЕ первого использования и внутри этих
+       функций компилировались как GETGLOBAL. Объявления подняты к hooksSetup,
+       поздние дубли удалены. Других forward-ref локалов нет (проверено вручную
+       по всем локалам модуля; attemptRecovery форвард-объявлен корректно).
+    2) [КРИТИЧНО, net-restore] teardownHooks делал rawset(net,
+       "FireUnreliableServer", nil): если оригинал жил НА ИНСТАНСЕ (а не в
+       metatable) — метод игры УДАЛЯЛСЯ насовсем и ВСЯ репликация движения
+       умирала после stop(). Теперь запоминаем источник оригинала
+       (fuWasInstance) и восстанавливаем соответственно.
+    3) [net-leak] hookedNet ставился только в ветке StateActor → без StateActor
+       хук FireUnreliableServer переживал stop() навсегда, а Sender (гейт по
+       hookedNet) не работал. hookedNet ставится и в ветке FireUnreliableServer.
+    4) [VelocityDesync] без FakeAngles faPacket не инкрементировался → flip был
+       КОНСТАНТОЙ: позиция уезжала на +amp в одну сторону (статичный оффсет =
+       телепорт-аномалия) вместо чередования. Теперь флип честно чередуется.
+    5) [SpinBot] spinPhase рос неограниченно и уходил в пакет сырым
+       (la.Orientation) → out-of-range → сервер отбрасывал весь пакет. Теперь % 2π.
+    6) [LeanSprint] roll камеры писался на RenderStepped ДО прохода камеры и
+       затирался каждый кадр. Теперь roll применяется в НАШЕМ хуке
+       CharacterCamera.Update сразу после оригинала (клиент пишет CFrame камеры
+       в своём RenderStepped, который идёт ПОСЛЕ всех BindToRenderStep — хук
+       единственное надёжное место), а бинд MOV_LeanRoll (Camera+2, после
+       FOV-бинда visuals) остаётся fallback'ом без cam-хука.
+    7) [inert] State.running теперь ставится в start() (как killaura) — раньше
+       модуль работал ТОЛЬКО если killaura/silentaim стартовали первыми.
+    8) [double-start] start() охраняется флагом started — повторный вызов плодил
+       осиротевшие коннекты (двойной tickSender/watchdog).
+    9) [leaks] tpWheelConn/tpPinchConn создаются в start() и снимаются в stop()
+       (раньше — при загрузке модуля, навсегда, +пара на каждый re-execute);
+       tpGui уничтожается в stop(); nilCache отпускается.
+    10) [restore-on-stop] noClipParts восстанавливаются даже когда ctrlCache
+        nil (фолбэк liveCtrl + прямой обход таблицы); velDesyncActive /
+        speedStateMode / forcedHS / MOV.Speed сбрасываются; la.Zoom
+        восстанавливается через getLiveLA() как fallback.
+    11) [CONFIG] заливка общего CONFIG теперь только отсутствующих ключей (как
+        killaura) — без стомпа ~90 ключей на каждом старте.
+    12) [hotkeys] DumpNilKey=K конфликтовал с FakeAnglesDiagKey=K (одно нажатие
+        делало оба) → перенесён на O. SuperJumpKey=H оставлен, но помечен:
+        H исторически использовался killaura под debug-дамп.
+    13) [perf] V2_ZERO/V3_ZERO хойстнуты, поля пишутся напрямую (без
+        pcall-замыканий на каждый физ-кадр); isLiveInputActive() считается ОДИН
+        раз за Heartbeat в upvalue; tickFly: ~8 pcall-замыканий/кадр → один
+        внешний pcall(tickFlyBody); сканы ctrl/cam пропускаются пока актор
+        Alive==false (экран смерти); getCam() в tick() перенесён ПОСЛЕ
+        обновления knownGoodLA (не жжём cam-скан впустую после респавна);
+        гост: Archivable=true вокруг Clone() (иначе клон персонажа всегда nil)
+        + бэкофф пересборки ~1с; watchdog не объявляет смерть на фризе >0.5с,
+        если актор рапортует Alive==true.
+]]
 return function(Lib)
     local Bridge    = Lib.Bridge
     local CONFIG    = Lib.CONFIG
@@ -177,6 +233,8 @@ return function(Lib)
 
         InfiniteJump = false,
         BunnyHop     = false,
+        -- ⚠ H исторически использовался killaura под debug-дамп — оставляем,
+        --   но помним о потенциальном пересечении, если тот хоткей вернут.
         SuperJumpKey = Enum.KeyCode.H,
         SuperJumpVel = 55,
 
@@ -192,18 +250,26 @@ return function(Lib)
 
         DiagKey    = Enum.KeyCode.RightBracket,
         DebugKey   = Enum.KeyCode.LeftBracket,
-        DumpNilKey = Enum.KeyCode.K,
+        -- FIX v2: было K — коллизия с FakeAnglesDiagKey (оба обрабатываются в
+        -- одном onInput → одно нажатие делало и дамп, и диаг-лог).
+        DumpNilKey = Enum.KeyCode.O,
     }
 
     local function now() return os.clock() end
     local function getCamera() return Workspace.CurrentCamera end
+
+    -- FIX v2 perf: нулевые векторы хойстнуты (раньше Vector2.new/Vector3.new
+    -- аллоцировались каждый физ-кадр в хуке _accelerate и в watchdog'е).
+    local V2_ZERO, V3_ZERO = Vector2.zero, Vector3.zero
 
     local function isLiveInputActive()
         if UIS:IsKeyDown(Enum.KeyCode.W) or UIS:IsKeyDown(Enum.KeyCode.A)
         or UIS:IsKeyDown(Enum.KeyCode.S) or UIS:IsKeyDown(Enum.KeyCode.D) then
             return true
         end
-        local ok, gp = pcall(function() return UIS:GetGamepadState(Enum.UserInputType.Gamepad1) end)
+        -- FIX v2 perf: pcall напрямую по методу вместо pcall(function() ... end)
+        -- — ноль замыканий на вызов.
+        local ok, gp = pcall(UIS.GetGamepadState, UIS, Enum.UserInputType.Gamepad1)
         if ok and gp then
             for _, s in ipairs(gp) do
                 if s.KeyCode == Enum.KeyCode.Thumbstick1 and s.Position.Magnitude > 0.15 then
@@ -212,11 +278,16 @@ return function(Lib)
             end
         end
         if UIS.TouchEnabled then
-            local okT, touches = pcall(function() return UIS:GetTouches() end)
+            local okT, touches = pcall(UIS.GetTouches, UIS)
             if okT and touches and #touches > 0 then return true end
         end
         return false
     end
+
+    -- FIX v2 perf: isLiveInputActive() дёргался ДВАЖДЫ за кадр (хук _accelerate
+    -- на каждый физ-шаг + tickSpeedWatchdog). Теперь считается ОДИН раз за
+    -- Heartbeat в этот upvalue, хук/watchdog только читают.
+    local liveInputNow = false
 
     local knownGoodLA = nil
 
@@ -228,6 +299,14 @@ return function(Lib)
 
     local hooksSetup    = false
     local camHooksSetup = false
+
+    -- FIX v2 (КРИТИЧНО, fwd-ref): эти локалы обязаны быть объявлены ВЫШЕ
+    -- currentZoomMax и хука Update контроллера. Раньше они объявлялись ПОСЛЕ
+    -- (~1199-1200), поэтому внутри тех функций camCache/ctrlCache
+    -- компилировались как ГЛОБАЛЬНЫЕ (всегда nil): zoom-лимит вечно падал на
+    -- MOV.ThirdPersonMax, а сравнение self == ctrlCache было мёртвым.
+    local ctrlCache, findLastT, FIND_CD = nil, -999, 2.5
+    local camCache,  findCamLastT, FIND_CAM_CD = nil, -999, 2.5
 
     local logBuf = {}
     local function log(...)
@@ -641,6 +720,9 @@ return function(Lib)
     local origAccelerate, origDecelerate, origProcessNP, origJump, origCtrlUpdate = nil, nil, nil, nil, nil
     local origStateActor, hookedNet, hookedMt = nil, nil, nil
     local origFireUnrel = nil
+    -- FIX v2: откуда взят оригинал FireUnreliableServer — с ИНСТАНСА или из
+    -- metatable. От этого зависит корректное восстановление в teardownHooks.
+    local fuWasInstance = false
     local noClipParts   = {}
 
     local origCamUpdate, hookedCamMt, hookedCamObj = nil, nil, nil
@@ -708,21 +790,36 @@ return function(Lib)
         if tpGui then pcall(function() tpGui.Enabled = v end) end
     end
 
-    local tpWheelConn = UIS.InputChanged:Connect(newcclosure(function(input)
-        if not tpActive then return end
-        if input.UserInputType == Enum.UserInputType.MouseWheel then
-            local z = input.Position.Z
-            local sign = z > 0 and 1 or (z < 0 and -1 or 0)
-            adjustTPZoom(-sign * MOV.ThirdPersonWheelStep)
-        end
-    end))
+    -- FIX v2 (утечка): раньше эти коннекты создавались ПРИ ЗАГРУЗКЕ модуля, не
+    -- попадали в conns и жили до конца сессии (каждый re-execute добавлял ещё
+    -- пару). Теперь создаются в start() и снимаются в stop().
+    local tpWheelConn, tpPinchConn = nil, nil
 
-    local tpPinchConn = (UIS.TouchPinch and UIS.TouchPinch:Connect(newcclosure(function(_, scale, _, state)
-        if not tpActive then return end
-        if state == Enum.UserInputState.Change then
-            adjustTPZoom(-(scale - 1) * MOV.ThirdPersonPinchSens)
+    local function connectTPInput()
+        if not tpWheelConn then
+            tpWheelConn = UIS.InputChanged:Connect(newcclosure(function(input)
+                if not tpActive then return end
+                if input.UserInputType == Enum.UserInputType.MouseWheel then
+                    local z = input.Position.Z
+                    local sign = z > 0 and 1 or (z < 0 and -1 or 0)
+                    adjustTPZoom(-sign * MOV.ThirdPersonWheelStep)
+                end
+            end))
         end
-    end))) or nil
+        if not tpPinchConn and UIS.TouchPinch then
+            tpPinchConn = UIS.TouchPinch:Connect(newcclosure(function(_, scale, _, state)
+                if not tpActive then return end
+                if state == Enum.UserInputState.Change then
+                    adjustTPZoom(-(scale - 1) * MOV.ThirdPersonPinchSens)
+                end
+            end))
+        end
+    end
+
+    local function disconnectTPInput()
+        if tpWheelConn then pcall(function() tpWheelConn:Disconnect() end); tpWheelConn = nil end
+        if tpPinchConn then pcall(function() tpPinchConn:Disconnect() end); tpPinchConn = nil end
+    end
 
     local function unlockMt(mt)
         if type(setreadonly)    == "function" then pcall(setreadonly,    mt, false)
@@ -766,8 +863,16 @@ return function(Lib)
             if origCtrlUpdate  then rawset(mt,"Update",              origCtrlUpdate)  end
         end
         if hookedNet and origFireUnrel then
-            pcall(function() rawset(hookedNet, "FireUnreliableServer", nil) end)
+            -- FIX v2 (КРИТИЧНО): раньше здесь был безусловный rawset(...,nil).
+            -- Если оригинал жил НА ИНСТАНСЕ (см. setupHooks: сначала rawget по
+            -- net, потом metatable) — nil УДАЛЯЛ метод игры насовсем, и вся
+            -- репликация движения умирала после stop(). Инстансный оригинал
+            -- кладём обратно; metatable-оригинал — снимаем нашу обёртку (nil →
+            -- провал в metatable, как было до хука).
+            local restore = fuWasInstance and origFireUnrel or nil
+            pcall(function() rawset(hookedNet, "FireUnreliableServer", restore) end)
             origFireUnrel = nil
+            fuWasInstance = false
         end
         if hookedNet and origStateActor then
             local evts = rawget(hookedNet,"_events")
@@ -799,8 +904,10 @@ return function(Lib)
                 if flyActive then self.MoveSpeed = 0; return end
 
                 if MOV.Speed then
-                    local live = isLiveInputActive()
-                    if live then
+                    -- FIX v2 perf: читаем кэш кадра (liveInputNow) вместо
+                    -- повторного isLiveInputActive(); поля пишем напрямую —
+                    -- без pcall-замыканий и без Vector-аллокаций каждый физ-шаг.
+                    if liveInputNow then
                         lastMoveInputT = now()
                         local sprint = MOV.AutoSprint or UIS:IsKeyDown(MOV.SprintKey)
                         self.TrySprinting = sprint
@@ -808,8 +915,8 @@ return function(Lib)
                         self.MoveSpeed    = sprint and MOV.SprintSpeed or MOV.SpeedValue
                     else
                         self.MoveSpeed = 0
-                        pcall(function() self._lastMovement = Vector2.new(0, 0) end)
-                        pcall(function() self._groundedInputDirection = Vector3.new(0, 0, 0) end)
+                        self._lastMovement = V2_ZERO
+                        self._groundedInputDirection = V3_ZERO
                     end
                 else
                     oAcc(self, dt, inputMag)
@@ -1006,6 +1113,9 @@ return function(Lib)
             end
 
             local oFU = rawget(net, "FireUnreliableServer")
+            -- FIX v2: запоминаем, лежал ли оригинал НА ИНСТАНСЕ — teardownHooks
+            -- обязан восстанавливать его туда же (см. коммент там).
+            local fuInst = type(oFU) == "function"
             if type(oFU) ~= "function" then
                 local nmt = getmetatable(net)
                 if type(nmt) == "table" then
@@ -1015,6 +1125,12 @@ return function(Lib)
             end
             if type(oFU) == "function" then
                 origFireUnrel = oFU
+                fuWasInstance = fuInst
+                -- FIX v2 (утечка хука): hookedNet ставился только в ветке
+                -- StateActor. Без StateActor teardownHooks (гейт hookedNet и
+                -- origFireUnrel) не снимал ЭТОТ хук после stop(), а Sender
+                -- (тоже гейт по hookedNet) не работал вовсе.
+                hookedNet = net
                 rawset(net, "FireUnreliableServer", newcclosure(function(self, ...)
                     local isRM = (...) == "ReplicateMovement"
                     -- Всегда захватываем uid из штатных пакетов — нужен Sender'у.
@@ -1069,8 +1185,17 @@ return function(Lib)
                     elseif leanLockActive and n >= 11 then
                         a[11] = MOV.LeanLockValue
                     end
-                    -- VelocityDesync смещает позицию (независимо от FakeAngles)
-                    applyVelocityDesyncToArgs(a, n, flip or ((faPacket % 2 == 0) and 1 or -1))
+                    -- VelocityDesync смещает позицию (независимо от FakeAngles).
+                    -- FIX v2: без FakeAngles faPacket не рос → старый фолбэк
+                    -- ((faPacket % 2 == 0) and 1 or -1) давал ОДИН И ТОТ ЖЕ знак
+                    -- на каждый пакет: позиция уезжала на константный +amp в одну
+                    -- сторону (сервер видит статичный оффсет = телепорт-аномалия),
+                    -- а не чередовалась. Инкрементируем счётчик и здесь.
+                    if velDesyncActive and flip == nil then
+                        faPacket = faPacket + 1
+                        flip = (faPacket % 2 == 0) and 1 or -1
+                    end
+                    applyVelocityDesyncToArgs(a, n, flip or 1)
                     -- ── ДИАГНОСТИКА: печатаем что реально уходит на сервер ──
                     if MOV.FakeAnglesDiag and faDiagLeft > 0 then
                         faDiagLeft = faDiagLeft - 1
@@ -1115,6 +1240,28 @@ return function(Lib)
         _camLastT = t
         if d <= 0 or d > 0.5 then d = 1/60 end
         return d
+    end
+
+    -- ── LeanSprint roll ──────────────────────────────────────────────────────
+    -- FIX v2: раньше roll писался в cam.CFrame из renderTick (RenderStepped) —
+    -- ДО прохода камеры, и клиент (он пересчитывает CFrame камеры в СВОЁМ
+    -- RenderStepped, который идёт ПОСЛЕ всех BindToRenderStep) затирал его
+    -- каждый кадр — эффект был невидим. Объявлено ЗДЕСЬ (выше setupCamHooks),
+    -- чтобы applyLeanRoll не стал новым fwd-ref глобалом (см. FIX camCache).
+    -- Применение:
+    --   1) основной путь — наш хук CharacterCamera.Update, СРАЗУ после
+    --      оригинала (= сразу после записи камеры игрой);
+    --   2) fallback — бинд MOV_LeanRoll (Camera+2, после FOV-бинда visuals на
+    --      Camera+1), когда cam-хук не установлен.
+    -- Сглаживание (leanCur) считает tickLean из бинда; здесь только запись.
+    local leanCur = 0
+    local LEAN_BIND = "MOV_LeanRoll"
+    local function applyLeanRoll()
+        if not MOV.LeanSprint then return end
+        if math.abs(leanCur) <= 0.02 then return end
+        local cam = getCamera()
+        if not cam then return end
+        cam.CFrame = cam.CFrame * CFrame.Angles(0, 0, math.rad(leanCur))
     end
 
     local function teardownCamHooks()
@@ -1181,13 +1328,24 @@ return function(Lib)
             if not ok then
                 warn("[MOV] CharacterCamera.Update: ошибка перехвачена (не критично):", a)
                 pcall(forceCamState)
+                -- roll здесь НЕ применяем: игра не переписала CFrame → повторное
+                -- умножение накапливало бы крен на застывшем кадре.
                 return
             end
 
             if spinBotActive then
-                spinPhase = spinPhase + camDt() * MOV.SpinBotRPS * math.pi * 2
+                -- FIX v2: без wrap spinPhase рос неограниченно и уходил в пакет
+                -- сырым (la.Orientation → a[6], хук пропускает углы как есть,
+                -- когда активен только SpinBot) → out-of-range → сервер
+                -- отбрасывал ВЕСЬ пакет (позиция замерзала, см. коммент выше
+                -- про валидацию). Держим фазу в [0, 2π).
+                spinPhase = (spinPhase + camDt() * MOV.SpinBotRPS * math.pi * 2) % TWO_PI
             end
             pcall(forceCamState)
+            -- FIX v2 (LeanSprint): применяем roll СРАЗУ после оригинального
+            -- Update — единственная точка, гарантированно ПОСЛЕ записи камеры
+            -- игрой (её RenderStepped идёт после всех BindToRenderStep).
+            if MOV.LeanSprint then pcall(applyLeanRoll) end
 
             return a, b, c
         end))
@@ -1196,9 +1354,8 @@ return function(Lib)
         print("[MOV] Hook: CharacterCamera.Update ✓")
     end
 
-    local ctrlCache, findLastT, FIND_CD = nil, -999, 2.5
-    local camCache,  findCamLastT, FIND_CAM_CD = nil, -999, 2.5
-
+    -- FIX v2: объявления ctrlCache/camCache подняты к hooksSetup (см. выше) —
+    -- здесь остаются только поисковые обёртки.
     local _findCtrl = newcclosure(function()
         local c = findCtrlViaFiltergc()
         if c then print("[MOV] ctrl → filtergc"); return c end
@@ -1269,6 +1426,15 @@ return function(Lib)
         if ctrlCache and isCtrl(ctrlCache) then return ctrlCache end
         -- В машине персонажного контроллера НЕ существует → не сканируем вообще.
         if inVehicleNow() then return nil end
+        -- FIX v2 perf: на экране смерти актор рапортует Alive==false, isCtrl
+        -- всё равно отвергнет мёртвого — раньше filtergc/getgc гонялись каждые
+        -- FIND_CD весь экран смерти (+warn каждый раз). Новый контроллер после
+        -- респавна подхватится через liveCtrl (хук Update на метатаблице класса)
+        -- без сканов; фолбэк-скан в attemptRecovery снимает этот гейт сам.
+        do
+            local la = getLiveLA()
+            if type(la) == "table" and rawget(la, "Alive") == false then return nil end
+        end
         local t = now()
         if t - findLastT < FIND_CD then return nil end
         findLastT = t
@@ -1295,6 +1461,12 @@ return function(Lib)
             return liveCam
         end
         if camCache and isCam(camCache) then return camCache end
+        -- FIX v2 perf: тот же гейт, что и в getCtrl — мёртвым cam-сканы не нужны
+        -- (isCam отвергнет по knownGoodLA), живая камера вернётся через liveCam.
+        do
+            local la = getLiveLA()
+            if type(la) == "table" and rawget(la, "Alive") == false then return nil end
+        end
         local t = now()
         if t - findCamLastT < FIND_CAM_CD then return nil end
         findCamLastT = t
@@ -1359,8 +1531,16 @@ return function(Lib)
         RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
     }
 
+    local faGhostRetryT = -999   -- FIX v2: бэкофф пересборки госта (см. tickFakeGhost)
+
     local function buildFakeGhost(char)
+        -- FIX v2: у персонажей Roblox Archivable=false по умолчанию → Clone()
+        -- возвращал nil ВСЕГДА, и цикл пересборки крутился вхолостую каждый
+        -- кадр. Временно поднимаем Archivable и возвращаем как было.
+        local prevArch = nil
+        pcall(function() prevArch = char.Archivable; char.Archivable = true end)
         local ok, clone = pcall(function() return char:Clone() end)
+        if prevArch ~= nil then pcall(function() char.Archivable = prevArch end) end
         if not ok or not clone then return end
         -- v19.2 FIX Lean: в игре lean — это РОЛЛ Motor6D UpperTorso (см. дамп
         -- ActorClass:2704), а не наклон всего тела. Чтобы Motor6D работали,
@@ -1498,6 +1678,11 @@ return function(Lib)
         end
         if not faGhostModel or not faGhostModel.Parent then
             destroyFakeGhost()
+            -- FIX v2: бэкофф ~1с — раньше при Clone()==nil (Archivable, см.
+            -- buildFakeGhost) destroy+clone гонялись КАЖДЫЙ RenderStepped-кадр.
+            local t = now()
+            if t - faGhostRetryT < 1 then return end
+            faGhostRetryT = t
             -- FIX: destroyFakeGhost resets faGhostHidden=false; buildFakeGhost
             -- creates fresh parts at ghostTr so the firstPerson re-check below
             -- will correctly apply hide/show on the very first tick.
@@ -1660,10 +1845,12 @@ return function(Lib)
         if not MOV.Speed then return end
         if flyActive then return end
 
-        if not isLiveInputActive() then
+        -- FIX v2 perf: liveInputNow — кэш кадра (см. Heartbeat), прямые записи
+        -- вместо pcall-замыканий и Vector-аллокаций.
+        if not liveInputNow then
             ctrl.MoveSpeed = 0
-            pcall(function() ctrl._lastMovement = Vector2.new(0, 0) end)
-            pcall(function() ctrl._groundedInputDirection = Vector3.new(0, 0, 0) end)
+            ctrl._lastMovement = V2_ZERO
+            ctrl._groundedInputDirection = V3_ZERO
         end
     end
 
@@ -1714,18 +1901,15 @@ return function(Lib)
         end
     end
 
-    local function tickFly(ctrl, dt)
-        if not flyActive then flyLastPos = nil; return end
-        -- В машине персонажного ctrl нет → флай неприменим; не трогаем ввод (Ctrl),
-        -- чтобы не мешать управлению транспортом.
-        if inVehicleNow() then flyLastPos = nil; return end
-        if not ctrl then return end
-
+    -- FIX v2 perf: тело полёта вынесено из per-statement pcall-обёрток (~8
+    -- замыканий на КАЖДЫЙ кадр) под ОДИН внешний pcall(tickFlyBody, ...) в
+    -- tickFly. Записи полей — напрямую, чтение полей актора — через rawget
+    -- (не может бросить и не дёргает metatable).
+    local function tickFlyBody(ctrl, dt)
         ctrl.VelocityGravity = 0
         ctrl.IsGrounded      = true
         ctrl.MoveSpeed       = 0
-
-        pcall(function() ctrl._startPhysics = nil end)
+        ctrl._startPhysics   = nil
 
         local la = rawget(ctrl, "_localActor")
 
@@ -1743,44 +1927,44 @@ return function(Lib)
 
         local curYaw = 0
         if type(la) == "table" then
-            local okY, yaw = pcall(rawget, la, "Orientation")
-            if okY and type(yaw) == "number" then curYaw = yaw end
+            local yaw = rawget(la, "Orientation")
+            if type(yaw) == "number" then curYaw = yaw end
         end
         local newCFrame = CFrame.new(newPos) * CFrame.Angles(0, curYaw, 0)
 
-        pcall(function() ctrl:Teleport(newCFrame) end)
-        pcall(function() ctrl._position = newPos end)
+        ctrl:Teleport(newCFrame)
+        ctrl._position = newPos
 
-        pcall(function()
-            local cyl = rawget(ctrl, "_cylinder")
+        local cyl = rawget(ctrl, "_cylinder")
+        if typeof(cyl) == "Instance" then
             local hullH = rawget(ctrl, "_hullHeight") or 6
-            if typeof(cyl) == "Instance" then
-                cyl.CFrame = CFrame.new(newPos, newPos + Vector3.new(0, 1, 0))
-                            * CFrame.Angles(0, math.pi / 2, 0)
-                cyl.Size = Vector3.new(hullH - 3, 3, 3)
-            end
-        end)
-        pcall(function() ctrl._lastSafePosition = newPos end)
+            cyl.CFrame = CFrame.new(newPos, newPos + Vector3.new(0, 1, 0))
+                        * CFrame.Angles(0, math.pi / 2, 0)
+            cyl.Size = Vector3.new(hullH - 3, 3, 3)
+        end
+        ctrl._lastSafePosition = newPos
 
         if type(la) == "table" then
-            pcall(function()
-                la.SimulatedPosition = newPos
-                la.ForceNextPosition = newPos
-                la.Position          = newPos
-                la.CFrame            = newCFrame
-                la._lastCFrame       = newCFrame
-                la.Direction         = Vector2.new(0, 0)
-            end)
-        end
-
-        if type(la) == "table" then
-            local okR, rp = pcall(function() return la.RootPart end)
-            if okR and typeof(rp) == "Instance" then
-                pcall(function()
-                    rp.CFrame = newCFrame
-                end)
+            la.SimulatedPosition = newPos
+            la.ForceNextPosition = newPos
+            la.Position          = newPos
+            la.CFrame            = newCFrame
+            la._lastCFrame       = newCFrame
+            la.Direction         = V2_ZERO
+            local rp = rawget(la, "RootPart")
+            if typeof(rp) == "Instance" then
+                rp.CFrame = newCFrame
             end
         end
+    end
+
+    local function tickFly(ctrl, dt)
+        if not flyActive then flyLastPos = nil; return end
+        -- В машине персонажного ctrl нет → флай неприменим; не трогаем ввод (Ctrl),
+        -- чтобы не мешать управлению транспортом.
+        if inVehicleNow() then flyLastPos = nil; return end
+        if not ctrl then return end
+        pcall(tickFlyBody, ctrl, dt)
     end
 
     local function tickBunnyHop(ctrl)
@@ -1813,17 +1997,20 @@ return function(Lib)
         end
     end
 
-    local leanCur = 0
+    -- FIX v2 (LeanSprint): раньше здесь писался cam.CFrame прямо из
+    -- RenderStepped (до прохода камеры) — клиент затирал крен каждый кадр.
+    -- Теперь tickLean ТОЛЬКО сглаживает leanCur (объявлен выше setupCamHooks
+    -- вместе с applyLeanRoll); сам крен пишет applyLeanRoll из cam-хука ПОСЛЕ
+    -- оригинального Update. Вызывается из бинда MOV_LeanRoll (Camera+2, после
+    -- FOV-бинда visuals); без установленного cam-хука применяем крен прямо
+    -- отсюда — лучший из доступных fallback'ов.
     local function tickLean(ctrl, dt)
-        if not MOV.LeanSprint then leanCur=0; return end
-        local cam=getCamera(); if not cam then return end
-        local gid = rawget(ctrl,"_groundedInputDirection")
+        if not MOV.LeanSprint then leanCur = 0; return end
+        local gid = rawget(ctrl, "_groundedInputDirection")
         local moving = gid and gid.Magnitude > 0.05 or false
         local target = (ctrl.IsSprinting and moving) and MOV.LeanAngle or 0
-        leanCur = leanCur + (target-leanCur)*math.clamp(dt*12,0,1)
-        if math.abs(leanCur)>0.02 then
-            cam.CFrame = cam.CFrame * CFrame.Angles(0,0,math.rad(leanCur))
-        end
+        leanCur = leanCur + (target - leanCur) * math.clamp(dt * 12, 0, 1)
+        if not camHooksSetup then applyLeanRoll() end
     end
 
     local function runDiagnostic()
@@ -2016,6 +2203,10 @@ return function(Lib)
             -- один раз восстанавливаем через скан.
             if not ctrl then
                 print("[MOV] Respawn: liveCtrl не появился — фолбэк на скан")
+                -- FIX v2: сталый knownGoodLA (мёртвый актор) блокировал бы скан
+                -- (гейт Alive==false в getCtrl/getCam) и isCam-проверку новой
+                -- камеры. Фолбэк — единственная точка, где скан нужен намеренно.
+                knownGoodLA = nil
                 resetCtrlCache()
                 ctrl = getCtrl()
                 getCam()
@@ -2312,11 +2503,17 @@ return function(Lib)
     end
 
     local conns = {}
+    -- FIX v2 (double-start): без гейта повторный start() перезаписывал
+    -- conns[1..6] — старые коннекты оставались живыми, но недостижимыми, и
+    -- каждый тик исполнялся дважды (двойной tickSender, двойной watchdog).
+    local started = false
 
     local tick = LPH_NO_VIRTUALIZE(function(dt)
         if not State.running then return end
         local ctrl = getCtrl()
-        getCam()
+        -- FIX v2 perf: getCam() перенесён НИЖЕ — после обновления knownGoodLA.
+        -- Раньше первый кадр после респавна жёг полный filtergc cam-скан, чей
+        -- результат isCam тут же отвергал по УСТАРЕВШЕМУ knownGoodLA.
 
         -- В машине персонажного контроллера НЕТ (ctrl == nil), но мы ЖИВЫ. Без этой
         -- ветки tick принимал вход в транспорт за смерть (ctrl исчез) и дёргал
@@ -2324,6 +2521,7 @@ return function(Lib)
         -- трогаем персонажные тики и НЕ меняем wasCtrlAliveLastFrame (чтобы выход
         -- из машины тоже не читался как смерть).
         if ctrl == nil and inVehicleNow() then
+            getCam()   -- как раньше: кэш камеры поддерживается и в транспорте
             return
         end
 
@@ -2335,11 +2533,24 @@ return function(Lib)
         local ctrlSwapped = aliveNow and knownGoodCtrl ~= nil and not rawequal(ctrl, knownGoodCtrl)
 
         if (wasCtrlAliveLastFrame and not aliveNow) or identitySwapped or ctrlSwapped then
+            -- FIX v2 (ложная смерть на хитче): кадр длиннее LIVE_TTL (0.5с) →
+            -- getCtrl() возвращает nil при ЖИВОМ персонаже, и watchdog сносил
+            -- гост и кэши. Если актор рапортует Alive==true — это хитч, не
+            -- смерть: выходим, НЕ трогая wasCtrlAliveLastFrame (проверка
+            -- перевзведётся на следующем кадре).
+            if not aliveNow then
+                local liveLA = getLiveLA()
+                if type(liveLA) == "table" and rawget(liveLA, "Alive") == true then
+                    return
+                end
+            end
             watchdogDeathCount = watchdogDeathCount + 1
             pcall(handleLocalDeath, lastKnownCtrl)
         end
         wasCtrlAliveLastFrame = aliveNow
         if aliveNow then lastKnownCtrl = ctrl; knownGoodLA = la; knownGoodCtrl = ctrl end
+
+        getCam()   -- FIX v2: только теперь, со свежим knownGoodLA (см. выше)
 
         if not aliveNow or identitySwapped or ctrlSwapped then return end
         tickFly(ctrl, dt)
@@ -2356,10 +2567,9 @@ return function(Lib)
 
     local renderTick = LPH_NO_VIRTUALIZE(function(dt)
         if not State.running then return end
-        if MOV.LeanSprint then
-            local ctrl = ctrlCache
-            if ctrl and isCtrl(ctrl) then tickLean(ctrl, dt) end
-        end
+        -- FIX v2: tickLean отсюда убран — RenderStepped-коннект идёт ДО прохода
+        -- камеры, и крен затирался. Теперь: бинд MOV_LeanRoll (Camera+2, см.
+        -- start()) сглаживает leanCur, а крен пишет cam-хук (applyLeanRoll).
         pcall(tickFakeGhost)
     end)
 
@@ -2367,15 +2577,38 @@ return function(Lib)
     _M.CONFIG = MOV
 
     function _M.start()
-        for k, v in pairs(MOV) do CONFIG[k] = v end
+        if started then return end   -- FIX v2: см. коммент у объявления started
+        started = true
+        -- FIX v2 (CONFIG-стомп): раньше ~90 плоских ключей безусловно
+        -- перезаписывались в ОБЩИЙ CONFIG на каждом старте (killaura этот же
+        -- паттерн уже чинил). Дозаполняем только отсутствующие.
+        for k, v in pairs(MOV) do if CONFIG[k] == nil then CONFIG[k] = v end end
+        -- FIX v2 (инертный модуль): State.running ставится только killaura /
+        -- silentaim — загруженный первым (или единственным) movement молча не
+        -- делал НИЧЕГО (оба тика гейтятся на State.running). Зеркалим killaura.
+        State.running = true
 
         conns[1] = RunService.Heartbeat:Connect(newcclosure(function(dt)
+            liveInputNow = isLiveInputActive()   -- FIX v2 perf: один вызов на кадр
             pcall(tick, dt)
             pcall(tickSender, dt)   -- высокочастотный FakeAngles/VelocityDesync Sender
         end))
         conns[2] = RunService.RenderStepped:Connect(newcclosure(function(dt)
             pcall(renderTick, dt)
         end))
+        -- FIX v2 (LeanSprint): сглаживание крена — в бинде ПОСЛЕ прохода камеры
+        -- (Camera+2; FOV-бинд visuals сидит на Camera+1). Сам крен пишет cam-хук
+        -- (applyLeanRoll после оригинального Update); без хука tickLean применит
+        -- его отсюда сам (fallback).
+        pcall(function()
+            RunService:BindToRenderStep(LEAN_BIND, Enum.RenderPriority.Camera.Value + 2,
+                newcclosure(function(dt)
+                    if not State.running or not MOV.LeanSprint then leanCur = 0 return end
+                    local ctrl = ctrlCache
+                    if ctrl and isCtrl(ctrl) then tickLean(ctrl, dt) end
+                end))
+        end)
+        connectTPInput()   -- FIX v2: колесо/пинч TP-зума теперь живут в start/stop
         -- NOTE: physical toggle-hotkeys are intentionally NOT connected here.
         -- All features are driven from the UI (toggles) and via user-assigned
         -- MacLib keybinds (empty by default, set in the Movement tab). onInput /
@@ -2413,20 +2646,43 @@ return function(Lib)
     end
 
     function _M.stop()
+        started = false   -- FIX v2: разрешаем следующий start()
         for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
         conns = {}
         if ijConn then ijConn:Disconnect(); ijConn=nil end
+        pcall(function() RunService:UnbindFromRenderStep(LEAN_BIND) end)   -- FIX v2
+        disconnectTPInput()   -- FIX v2: wheel/pinch-коннекты больше не живут вечно
+        -- FIX v2: tpGui (ScreenGui + 2 кнопочных коннекта) никогда не удалялся.
+        if tpGui then pcall(function() tpGui:Destroy() end) end
+        tpGui, tpGuiMinus, tpGuiPlus = nil, nil, nil
         flyActive=false; wantFly=false; straferActive=false; spinBotActive=false
         tpActive=false; MOV.NoClip=false
+        -- FIX v2: Speed не сбрасывался (в отличие от NoClip) — спидхак молча
+        -- переживал рестарт. Сбрасываем для консистентности.
+        MOV.Speed=false
         noFallActive=false; fakeAngMode=0; leanLockActive=false; invisActive=false
+        -- FIX v2: velDesyncActive молча ре-армился на следующем start();
+        -- speedStateMode/forcedHS переприменяли форс-стейт, едва хуки вставали.
+        velDesyncActive=false
+        speedStateMode=0; forcedHS=nil
         nfFalling=false; nfGroundHS=nil
+        leanCur=0
         pcall(destroyFakeGhost)
-        teardownHooks(ctrlCache)
-        teardownCamHooks()
-        if ctrlCache then
-            local la = rawget(ctrlCache,"_localActor")
-            if type(la)=="table" then pcall(function() la.Zoom=0 end) end
+        -- FIX v2: после смерти ctrlCache==nil → CanCollide живого персонажа не
+        -- восстанавливался. Фолбэк на liveCtrl, затем прямой обход noClipParts
+        -- (доберёт и части, не найденные среди потомков текущего персонажа).
+        teardownHooks(ctrlCache or liveCtrl)
+        for p, was in pairs(noClipParts) do
+            pcall(function() p.CanCollide = was end)
         end
+        noClipParts = {}
+        teardownCamHooks()
+        do
+            local la = ctrlCache and rawget(ctrlCache, "_localActor") or nil
+            if type(la) ~= "table" then la = getLiveLA() end   -- FIX v2: fallback
+            if type(la) == "table" then pcall(function() la.Zoom = 0 end) end
+        end
+        nilCache = nil; nilCacheT = -999   -- FIX v2: не держим снапшот getnilinstances
         print("[MOV] stopped")
     end
 
