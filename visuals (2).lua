@@ -1,6 +1,39 @@
 --[[
-    BRM5 Visuals / World  v2  (scripts/visuals.lua)
+    BRM5 Visuals / World  v3  (scripts/visuals.lua)
     Контракт загрузчика: файл возвращает function(Lib) -> { start=fn, stop=fn }
+
+    ── BRM5 Visuals v3 — CHANGELOG от v2: ──────────────────────────────────────
+      • FOV: BindToRenderStep бессилен — ВСЕ бинды (0..2000) идут ДО
+        RenderStepped-коннектов, а Flux пишет FieldOfView именно там. Теперь
+        перебиваем его запись через GetPropertyChangedSignal("FieldOfView") +
+        следим за сменой CurrentCamera; в start() защитный Unbind + warn при
+        неудаче бинда; restore FOV в stop() — только если реально меняли.
+      • SelfSkin: игра подменяет контроллер/актор БЕЗ Alive=false (транспорт и
+        пр.) — кэш _ctrl протухал НАВСЕГДА, скин пропадал до конца сессии.
+        Сброс кэша при «живом» акторе без модели; isCtrl отсекает контроллер,
+        на который актор уже не ссылается; nil-ветка findCtrl затроттлена
+        (было: 60 filtergc-сканов/сек в лобби/спектейте).
+      • NoFWait: UI-тоггл ставил только флаг — enable/disableNoFWait звал лишь
+        хоткей Num7, из меню фича была мёртвой. Теперь сеттер зовёт их сам.
+      • Ambient/Fullbright/NoFog: выкл из UI не откатывал Lighting (это делали
+        только хоткеи) — мир оставался перекрашенным. Общий off-путь lightingOff().
+      • FreeGun: выкл тоггла/хоткея не возвращал la.SeatCanEquip (только stop);
+        restoreFreeGunHook больше не форсит V.FreeGunEnabled=false.
+      • heartbeat: был ОДИН pcall на все шаги — упавший шаг молча выключал все
+        последующие до конца сессии (log — no-op). Теперь pcall на каждый шаг
+        + warn не чаще 1/сек на шаг.
+      • Хоткеи синкают MacLib-тоггл (MacLib сохраняет ЭЛЕМЕНТЫ, не CONFIG —
+        SaveConfig после хоткея писал устаревшее значение); флаг-фолбэк
+        выровнен с kit ("BRM5_<имя>", а не tostring).
+      • VmRestyleSec добавлен в SETTINGS (+слайдер в Debug); слайдеры Hand
+        Right/Up/Tilt (ViewmodelOffset/Tilt читались, но UI не было);
+        AmbShadows/AmbFogOn сбрасывают пресет в Custom, эхо ambRefresh — нет.
+      • Память/перф: promptAttrConn чистится по Destroying (тек на каждый
+        промпт), маркеры BRM5_timer/BRM5_hold снимаются в disableNoFWait,
+        поиск ViewmodelClass затроттлен (2с), vm-хук без table.pack/замыкания
+        на кадр, applySelfHighlight пишет только при изменении, lightingStep
+        ~4 Гц (ClockTime — каждый кадр), restore* красят и де-парентнутые
+        части, sort в tickGradientStore читает Position внутри pcall.
 
     ── ХОТКЕИ (Numpad) ─────────────────────────────────────────────────────────
       Num1  Viewmodel      — смещение рук, FOV, материал/цвет рук от 1-го лица
@@ -22,8 +55,10 @@
       ViewModel   : { Root(BasePart), Offset(CFrame), ADSOffset, ADSLerp, CQB,
                       SprintLerp, NVGFOV, Canted, Recoil, Material, :SetModel,
                       :Update }   ← Update() ставит Root.CFrame каждый кадр
-      Camera      : FieldOfView пересчитывается КАЖДЫЙ кадр → FOV меняем через
-                    BindToRenderStep (приоритет после камеры)
+      Camera      : FieldOfView каждый кадр пишет Flux в СВОЁМ RenderStepped-
+                    коннекте, который идёт ПОСЛЕ всех BindToRenderStep (любой
+                    приоритет — бинд НЕ перебивает) → FOV держим через
+                    GetPropertyChangedSignal("FieldOfView") поверх записи игры
       Vehicle     : { Throttle, Steering, Seats, VehicleMain, _derivedVelocity }
       LockPickCtrl: { _picks(0..6), _speed, _expires, _cancelled, _localActor }
                     при _picks==6 шлёт FireServer("ActivateInteract","Picked")
@@ -95,6 +130,9 @@ return function(Lib)
         ViewmodelOffset           = Vector3.new(0, 0, 0),        -- сдвиг рук: право / верх / назад (studs)
         ViewmodelTilt             = 0,                           -- наклон рук (градусы)
         ViewmodelDepth            = 0,     -- приближение рук по Z, в сотых studs (0 = как в игре)
+        -- FIX v3: ключ читался (период до-обхода частей рук/оружия), но нигде
+        -- не задавался — работал только фолбэк `or 3`. Теперь настоящий дефолт.
+        VmRestyleSec              = 3,     -- раз в сколько секунд до-красить поздние части (руки/ствол)
         WorldFOVEnabled           = false, -- мировой FOV камеры (отдельно от рук)
         WorldFOV                  = 70,
 
@@ -206,7 +244,19 @@ return function(Lib)
         if type(rawget(t, "IsGrounded"))   ~= "boolean" then return false end
         if type(rawget(t, "IsSprinting"))  ~= "boolean" then return false end
         local la = rawget(t, "_localActor")
-        return type(la) == "table" and rawget(la, "IsLocalPlayer") ~= false
+        if type(la) ~= "table" or rawget(la, "IsLocalPlayer") == false then return false end
+        -- FIX v3: игра пересоздаёт контроллер, НЕ трогая Alive (movement ловит
+        -- это как ctrlSwapped) — старая таблица проходила все проверки и кэш
+        -- жил вечно. Отсекаем контроллер, если актор ссылается на ДРУГОЙ
+        -- ПЕРСОНАЖНЫЙ контроллер. Важно: в транспорте la.Controller — это
+        -- контроллер машины (без MoveSpeed), его за подмену НЕ считаем, иначе
+        -- скин слетал бы каждый раз при посадке.
+        local backRef = rawget(la, "Controller")
+        if type(backRef) == "table" and not rawequal(backRef, t)
+        and type(rawget(backRef, "MoveSpeed")) == "number" then
+            return false
+        end
+        return true
     end
     local _scanCd, _lastScan = 1.0, -999
     local _ctrl
@@ -237,18 +287,18 @@ return function(Lib)
     local function findCtrl()
         -- кэш валиден И актор жив → используем без сканов
         if _ctrl and isCtrl(_ctrl) and ctrlAlive(_ctrl) then return _ctrl end
-        -- кэш есть, но актор мёртв (умерли/респавн): троттлим ре-скан на живой
-        if _ctrl and isCtrl(_ctrl) then
-            local t = now()
-            if t - _ctrlRescan >= _scanCd then
-                _ctrlRescan = t
-                local fresh = rescanCtrl()
-                if fresh then return fresh end
-            end
-            return _ctrl   -- пока живого нет — возвращаем мёртвый (мы реально мертвы)
+        -- FIX v3: nil-ветка (лобби/спектейт/пре-спавн/сброс кэша) звала
+        -- rescanCtrl БЕЗ троттла — полный filtergc-проход каждый Heartbeat,
+        -- 60 сканов/сек. Теперь троттл общий для обеих веток; пока живого
+        -- нет — возвращаем мёртвый кэш (мы реально мертвы) либо nil.
+        local t = now()
+        if t - _ctrlRescan < _scanCd then
+            return (_ctrl and isCtrl(_ctrl)) and _ctrl or nil
         end
-        _ctrl = nil
-        return rescanCtrl()
+        _ctrlRescan = t
+        local fresh = rescanCtrl()
+        if fresh then return fresh end
+        return (_ctrl and isCtrl(_ctrl)) and _ctrl or nil
     end
     local function getLA()
         local c = findCtrl(); return c and rawget(c, "_localActor") or nil
@@ -325,7 +375,10 @@ return function(Lib)
 
     local function restoreViewmodelStyle()
         for part, s in pairs(vmStyledParts) do
-            if part and part.Parent then
+            -- FIX v3: гейт `part.Parent` пропускал де-парентнутые части — игра
+            -- их пере-использует, и они оставались крашеными навсегда. Свойства
+            -- отпарентченных инстансов писать можно (pcall уже есть).
+            if part then
                 pcall(function()
                     part.Material    = s.M
                     part.Color       = s.C
@@ -404,7 +457,8 @@ return function(Lib)
     -- восстановление произвольного store (руки ИЛИ оружие)
     local function restoreStore(store)
         for part, s in pairs(store) do
-            if part and part.Parent then
+            -- FIX v3: без гейта `part.Parent` — см. restoreViewmodelStyle
+            if part then
                 pcall(function()
                     part.Material     = s.M
                     part.Color        = s.C
@@ -438,6 +492,18 @@ return function(Lib)
     -- spread растягивает/сжимает волну по индексам; 0 → все части в фазе (синхронно).
     -- Вынесено из горячего цикла: одна функция вместо замыкания на часть/кадр.
     local function _setPartColor(part, col) part.Color = col end
+    local function _getPartPos(part) return part.Position end
+    -- FIX v3: старый компаратор считывал Position ПОВТОРНО уже СНАРУЖИ pcall
+    -- (использовался только boolean) — защита не защищала ничего. Теперь
+    -- значение берётся изнутри pcall, упавшая часть даёт Vector3.zero.
+    local function _safePos(part)
+        local ok, pos = pcall(_getPartPos, part)
+        return (ok and typeof(pos) == "Vector3") and pos or Vector3.zero
+    end
+    local function _posLess(a, b)
+        local pa, pb = _safePos(a), _safePos(b)
+        return (pa.Y + pa.X) < (pb.Y + pb.X)
+    end
     local function tickGradientStore(store, spread, baseHue)
         -- 1) Собираем пары (part, rec) где нужно посчитать gp
         -- FIX: таблица needPhase создавалась каждый вызов, даже когда все фазы
@@ -459,11 +525,7 @@ return function(Lib)
             local arr = {}
             for part in pairs(needPhase) do arr[#arr + 1] = part end
             -- Сортировка по базовой позиции: стабильная, не меняется при движении игрока
-            table.sort(arr, function(a, b)
-                local pa = pcall(function() return a.Position end) and a.Position or Vector3.zero
-                local pb = pcall(function() return b.Position end) and b.Position or Vector3.zero
-                return (pa.Y + pa.X) < (pb.Y + pb.X)
-            end)
+            table.sort(arr, _posLess)
             for i, part in ipairs(arr) do
                 local rec = needPhase[part]
                 if rec then
@@ -595,10 +657,122 @@ return function(Lib)
         gunStyledModel = weapon
     end
 
+    -- FIX v3 (перф): тело vm-хука вынесено в ИМЕНОВАННУЮ функцию уровня модуля.
+    -- Раньше на КАЖДЫЙ кадр аллоцировались table.pack + замыкание в pcall +
+    -- table.unpack — ровно тот паттерн, что уже чинили в tickGradientStore.
+    local vmHookBody = LPH_NO_VIRTUALIZE(function(self)
+        -- ГЕОМЕТРИЯ РУК (offset / tilt / zoom) — ВНЕ гейта
+        -- V.ViewmodelEnabled.
+        -- FIX: раньше этот блок был внутри `if V.ViewmodelEnabled`,
+        -- то есть Hand Zoom и смещение работали только когда включена
+        -- ПЕРЕКРАСКА рук. Это НЕ связанные вещи: человек крутил ползунок
+        -- при выключенном тумблере и не понимал, почему ничего нет.
+        --
+        -- Про сам зум: «Custom FOV» раньше писал в Camera.FieldOfView —
+        -- это мировой FOV (отсюда ощущение смены чувствительности). В
+        -- BRM5 руки рендерятся ОБЩЕЙ камерой (дамп ViewmodelClass:822,
+        -- FOV там только масштабирует отдачу), отдельной камеры для
+        -- viewmodel нет. Честный аналог «зума рук» — двигать сами руки
+        -- по оси Z.
+        do
+            local root = rawget(self, "Root")
+            if root and root.Parent then
+                local o = V.ViewmodelOffset or Vector3.new()
+                local tilt = V.ViewmodelTilt or 0
+                local depth = (V.ViewmodelDepth or 0) / 100   -- studs
+                if o.Magnitude > 0.001 or math.abs(tilt) > 0.001
+                or math.abs(depth) > 0.0001 then
+                    root.CFrame = root.CFrame
+                        * CFrame.new(o.X, o.Y, -o.Z + depth)
+                        * CFrame.Angles(0, 0, math.rad(tilt))
+                end
+            end
+        end
+        if V.ViewmodelEnabled then
+            -- стилизация рук — только один раз (не каждый кадр)
+            if V.ViewmodelMaterialEnabled or V.ViewmodelColorEnabled
+            or (V.ViewmodelTransparency or 0) > 0 or V.ViewmodelGradientEnabled then
+                applyViewmodelStyle(self)
+                -- градиент — перекрас каждый кадр под текущую фазу
+                if V.ViewmodelGradientEnabled then
+                    tickGradientStore(vmStyledParts, 0.4, now() * (V.GradientSpeed or 0.35))
+                end
+            elseif vmStyledVM then
+                restoreViewmodelStyle()
+            end
+        else
+            if vmStyledVM then restoreViewmodelStyle() end
+        end
+        -- GunModel Highlight — ТОЛЬКО модель оружия (self.CurrentModel),
+        -- НЕ руки. Highlight держим в контейнере, адорним само оружие;
+        -- при смене ствола игра пересоздаёт CurrentModel — переадорним.
+        if V.GunModelEnabled then
+            local root2 = rawget(self, "Root")
+            local container = root2 and root2.Parent
+            local weapon = rawget(self, "CurrentModel")
+            -- Highlight is optional — can be disabled without disabling full GunModel
+            if V.GunModelHighlightEnabled ~= false then
+                if container and weapon and weapon.Parent then
+                    if not (gunHighlight and gunHighlight.Parent) then
+                        gunHighlight = Instance.new("Highlight")
+                        gunHighlight.Name = "BRM5_GunHL"
+                        gunHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    end
+                    -- FIX: у Highlight не было градиента вообще —
+                    -- переливалась только сама модель, а обводка
+                    -- оставалась статичной, из-за чего эффект выглядел
+                    -- рассинхронизированным. Теперь Highlight берёт
+                    -- тот же цвет волны, что и части оружия.
+                    if V.GunModelGradientEnabled and V.GunModelHighlightGradient ~= false then
+                        local gcol = gradientColorAt(now() * (V.GradientSpeed or 0.35))
+                        gunHighlight.FillColor    = gcol
+                        gunHighlight.OutlineColor = gcol
+                    else
+                        gunHighlight.FillColor    = V.GunModelFill
+                        gunHighlight.OutlineColor = V.GunModelOutline
+                    end
+                    gunHighlight.FillTransparency   = V.GunModelFillTransparency
+                    gunHighlight.OutlineTransparency = V.GunModelOutlineTransparency
+                    if gunHighlight.Adornee ~= weapon then gunHighlight.Adornee = weapon end
+                    gunHighlight.Parent = container
+                elseif gunHighlight then
+                    gunHighlight.Adornee = nil  -- оружие не экипировано сейчас
+                end
+            elseif gunHighlight then
+                -- Highlight toggled off while GunModel is still on
+                pcall(function() gunHighlight:Destroy() end); gunHighlight = nil
+            end
+            -- та же перекраска/материал, что и у рук — но для оружия
+            if V.GunModelColorEnabled or V.GunModelMaterialEnabled
+            or (V.GunModelTransparency or 0) > 0 or V.GunModelGradientEnabled then
+                applyGunStyle(self)
+                -- умный градиент: волна фазы бежит по частям (spread из конфига)
+                if V.GunModelGradientEnabled then
+                    tickGradientStore(gunStyledParts, V.GunModelGradientSpread or 1.6,
+                        now() * (V.GradientSpeed or 0.35))
+                end
+            elseif gunStyledModel then
+                restoreGunStyle()
+            end
+        else
+            if gunHighlight then
+                pcall(function() gunHighlight:Destroy() end)
+                gunHighlight = nil
+            end
+            if gunStyledModel then restoreGunStyle() end
+        end
+    end)
+
+    -- FIX v3: пока класс не найден (лобби/ранний джойн) filtergc-скан шёл
+    -- КАЖДЫЙ кадр при включённом Viewmodel/GunModel. Троттлим как у FreeGun.
+    local _vmScanT = -999
     local function ensureViewmodelHook()
         if vmHooked then return true end
         if type(hookfunction) ~= "function" then return false end
         if type(filtergc)     ~= "function" then return false end
+        local tScan = now()
+        if tScan - _vmScanT < 2.0 then return false end
+        _vmScanT = tScan
 
         -- Ищем ViewmodelClass. filtergc-проход по GC обёрнут в NO_VIRTUALIZE —
         -- под Luraph он обязан идти нативно (иначе фриз на раздутом GC).
@@ -629,110 +803,11 @@ return function(Lib)
             -- продолжал каждый кадр перекрашивать руки/оружие — и откатывал
             -- restoreViewmodelStyle буквально на следующем кадре.
             if not running then return vmOrigRef(self, dt, ...) end
-            local r = table.pack(vmOrigRef(self, dt, ...))   -- ← vmOrigRef, не origFn!
-            pcall(function()
-                -- ГЕОМЕТРИЯ РУК (offset / tilt / zoom) — ВНЕ гейта
-                -- V.ViewmodelEnabled.
-                -- FIX: раньше этот блок был внутри `if V.ViewmodelEnabled`,
-                -- то есть Hand Zoom и смещение работали только когда включена
-                -- ПЕРЕКРАСКА рук. Это НЕ связанные вещи: человек крутил ползунок
-                -- при выключенном тумблере и не понимал, почему ничего нет.
-                --
-                -- Про сам зум: «Custom FOV» раньше писал в Camera.FieldOfView —
-                -- это мировой FOV (отсюда ощущение смены чувствительности). В
-                -- BRM5 руки рендерятся ОБЩЕЙ камерой (дамп ViewmodelClass:822,
-                -- FOV там только масштабирует отдачу), отдельной камеры для
-                -- viewmodel нет. Честный аналог «зума рук» — двигать сами руки
-                -- по оси Z.
-                do
-                    local root = rawget(self, "Root")
-                    if root and root.Parent then
-                        local o = V.ViewmodelOffset or Vector3.new()
-                        local tilt = V.ViewmodelTilt or 0
-                        local depth = (V.ViewmodelDepth or 0) / 100   -- studs
-                        if o.Magnitude > 0.001 or math.abs(tilt) > 0.001
-                        or math.abs(depth) > 0.0001 then
-                            root.CFrame = root.CFrame
-                                * CFrame.new(o.X, o.Y, -o.Z + depth)
-                                * CFrame.Angles(0, 0, math.rad(tilt))
-                        end
-                    end
-                end
-                if V.ViewmodelEnabled then
-                    -- стилизация рук — только один раз (не каждый кадр)
-                    if V.ViewmodelMaterialEnabled or V.ViewmodelColorEnabled
-                    or (V.ViewmodelTransparency or 0) > 0 or V.ViewmodelGradientEnabled then
-                        applyViewmodelStyle(self)
-                        -- градиент — перекрас каждый кадр под текущую фазу
-                        if V.ViewmodelGradientEnabled then
-                            tickGradientStore(vmStyledParts, 0.4, now() * (V.GradientSpeed or 0.35))
-                        end
-                    elseif vmStyledVM then
-                        restoreViewmodelStyle()
-                    end
-                else
-                    if vmStyledVM then restoreViewmodelStyle() end
-                end
-                -- GunModel Highlight — ТОЛЬКО модель оружия (self.CurrentModel),
-                -- НЕ руки. Highlight держим в контейнере, адорним само оружие;
-                -- при смене ствола игра пересоздаёт CurrentModel — переадорним.
-                if V.GunModelEnabled then
-                    local root2 = rawget(self, "Root")
-                    local container = root2 and root2.Parent
-                    local weapon = rawget(self, "CurrentModel")
-                    -- Highlight is optional — can be disabled without disabling full GunModel
-                    if V.GunModelHighlightEnabled ~= false then
-                        if container and weapon and weapon.Parent then
-                            if not (gunHighlight and gunHighlight.Parent) then
-                                gunHighlight = Instance.new("Highlight")
-                                gunHighlight.Name = "BRM5_GunHL"
-                                gunHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                            end
-                            -- FIX: у Highlight не было градиента вообще —
-                            -- переливалась только сама модель, а обводка
-                            -- оставалась статичной, из-за чего эффект выглядел
-                            -- рассинхронизированным. Теперь Highlight берёт
-                            -- тот же цвет волны, что и части оружия.
-                            if V.GunModelGradientEnabled and V.GunModelHighlightGradient ~= false then
-                                local gcol = gradientColorAt(now() * (V.GradientSpeed or 0.35))
-                                gunHighlight.FillColor    = gcol
-                                gunHighlight.OutlineColor = gcol
-                            else
-                                gunHighlight.FillColor    = V.GunModelFill
-                                gunHighlight.OutlineColor = V.GunModelOutline
-                            end
-                            gunHighlight.FillTransparency   = V.GunModelFillTransparency
-                            gunHighlight.OutlineTransparency = V.GunModelOutlineTransparency
-                            if gunHighlight.Adornee ~= weapon then gunHighlight.Adornee = weapon end
-                            gunHighlight.Parent = container
-                        elseif gunHighlight then
-                            gunHighlight.Adornee = nil  -- оружие не экипировано сейчас
-                        end
-                    elseif gunHighlight then
-                        -- Highlight toggled off while GunModel is still on
-                        pcall(function() gunHighlight:Destroy() end); gunHighlight = nil
-                    end
-                    -- та же перекраска/материал, что и у рук — но для оружия
-                    if V.GunModelColorEnabled or V.GunModelMaterialEnabled
-                    or (V.GunModelTransparency or 0) > 0 or V.GunModelGradientEnabled then
-                        applyGunStyle(self)
-                        -- умный градиент: волна фазы бежит по частям (spread из конфига)
-                        if V.GunModelGradientEnabled then
-                            tickGradientStore(gunStyledParts, V.GunModelGradientSpread or 1.6,
-                                now() * (V.GradientSpeed or 0.35))
-                        end
-                    elseif gunStyledModel then
-                        restoreGunStyle()
-                    end
-                else
-                    if gunHighlight then
-                        pcall(function() gunHighlight:Destroy() end)
-                        gunHighlight = nil
-                    end
-                    if gunStyledModel then restoreGunStyle() end
-                end
-            end)
-            return table.unpack(r, 1, r.n)
+            -- Update() по дампу ничего не возвращает; на всякий случай ловим
+            -- до четырёх значений в ФИКСИРОВАННЫЕ локалы (без table.pack).
+            local r1, r2, r3, r4 = vmOrigRef(self, dt, ...)   -- ← vmOrigRef, не origFn!
+            pcall(vmHookBody, self)
+            return r1, r2, r3, r4
         end)
 
         local wrapped = (type(newcclosure) == "function")
@@ -812,6 +887,41 @@ return function(Lib)
         end
     end)
 
+    -- FIX v3: сам по себе бинд FOV НЕ работал. Roblox гоняет ВСЕ BindToRenderStep
+    -- (приоритеты 0..2000) ДО RenderStepped-коннектов, а Flux пересчитывает
+    -- Camera.FieldOfView именно в СВОЁМ RenderStepped-коннекте → наша запись
+    -- перетиралась каждый кадр ДО рендера при любом приоритете (killaura и
+    -- movement упёрлись в то же самое). Бинд оставлен для первичного применения
+    -- и восстановления при выкле, а ДЕРЖИТ значение перехват самой записи игры
+    -- через GetPropertyChangedSignal — без коллизий с Update-хуком movement.
+    local _fovConn, _fovCamConn = nil, nil
+    local _fovWriting = false
+
+    local applyFov = LPH_NO_VIRTUALIZE(function(cam)
+        local fov = V.WorldFOV or 0
+        if not (V.WorldFOVEnabled and fov > 0) then return end
+        cam = cam or Workspace.CurrentCamera
+        if not cam then return end
+        if _origFov == nil then _origFov = cam.FieldOfView end
+        if math.abs(cam.FieldOfView - fov) > 0.01 then
+            _fovWriting = true
+            pcall(function() cam.FieldOfView = fov end)
+            _fovWriting = false
+        end
+        fovApplied = true
+    end)
+
+    local function hookFovSignal()
+        if _fovConn then _fovConn:Disconnect(); _fovConn = nil end
+        local cam = Workspace.CurrentCamera
+        if not cam then return end
+        -- Flux пишет FieldOfView в СВОЁМ RenderStepped-коннекте, который идёт ПОСЛЕ
+        -- всех BindToRenderStep. Поэтому ловим саму запись и перебиваем её.
+        _fovConn = cam:GetPropertyChangedSignal("FieldOfView"):Connect(LPH_NO_VIRTUALIZE(function()
+            if not _fovWriting then applyFov(cam) end
+        end))
+    end
+
     ---------------------------------------------------------------------------
     -- 3. THIRD PERSON SKIN
     ---------------------------------------------------------------------------
@@ -836,6 +946,12 @@ return function(Lib)
             if ok and typeof(char) == "Instance" and char:IsA("Model") and char.Parent then
                 return char
             end
+            -- FIX v3: актор «жив», но модели нет → это брошенный (подменённый)
+            -- актор: игра пересоздала контроллер, НЕ тронув Alive. Без сброса
+            -- кэш _ctrl проходил isCtrl/ctrlAlive вечно, рескана не было, и
+            -- скин «интермиттентно» пропадал до конца сессии. Сбрасываем кэш —
+            -- findCtrl (затроттленный) пере-найдёт живую пару.
+            _ctrl = nil
         end
         local c = LP.Character
         if typeof(c) == "Instance" and c:IsA("Model") and c.Parent then
@@ -855,12 +971,17 @@ return function(Lib)
             selfHighlight.Name = "BRM5_SelfHL"
             selfHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
         end
-        selfHighlight.FillColor          = V.ThirdPersonFill
-        selfHighlight.OutlineColor       = V.ThirdPersonOutline
-        selfHighlight.FillTransparency   = V.ThirdPersonFillTransparency
-        selfHighlight.OutlineTransparency = 0
-        if selfHighlight.Adornee ~= char then selfHighlight.Adornee = char end
-        selfHighlight.Parent = char
+        -- FIX v3: 4 свойства + Parent писались КАЖДЫЙ кадр — теперь только
+        -- при реальном изменении (запись свойства дороже чтения).
+        local hl = selfHighlight
+        if hl.FillColor ~= V.ThirdPersonFill then hl.FillColor = V.ThirdPersonFill end
+        if hl.OutlineColor ~= V.ThirdPersonOutline then hl.OutlineColor = V.ThirdPersonOutline end
+        if hl.FillTransparency ~= V.ThirdPersonFillTransparency then
+            hl.FillTransparency = V.ThirdPersonFillTransparency
+        end
+        if hl.OutlineTransparency ~= 0 then hl.OutlineTransparency = 0 end
+        if hl.Adornee ~= char then hl.Adornee = char end
+        if hl.Parent ~= char then hl.Parent = char end
     end
 
     local function clearSelfHighlight()
@@ -872,7 +993,8 @@ return function(Lib)
 
     local function restoreSelfBody()
         for part, s in pairs(tpOrig) do
-            if part and part.Parent then
+            -- FIX v3: без гейта `part.Parent` — см. restoreViewmodelStyle
+            if part then
                 pcall(function() part.Material     = s.M end)
                 pcall(function() part.Color        = s.C end)
                 pcall(function() part.Transparency = s.T end)
@@ -1188,9 +1310,10 @@ return function(Lib)
         return false
     end
 
-    -- FIX: полностью снимаем FreeGun — и хук, и форс SeatCanEquip.
-    local function restoreFreeGunHook()
-        V.FreeGunEnabled = false
+    -- FIX v3: возврат SeatCanEquip вынесен отдельно — его обязан звать и
+    -- ОБЫЧНЫЙ выкл тоггла (UI/хоткей), а не только M.stop, иначе поле игры
+    -- оставалось пропатченным до выгрузки.
+    local function restoreFreeGunSeat()
         if _fgSeatOrig ~= nil then
             pcall(function()
                 local la = getLA()
@@ -1198,6 +1321,13 @@ return function(Lib)
             end)
             _fgSeatOrig = nil
         end
+    end
+
+    -- FIX: полностью снимаем FreeGun — и хук, и форс SeatCanEquip.
+    -- FIX v3: больше НЕ форсим V.FreeGunEnabled = false — ни одна другая фича
+    -- не мутирует конфиг юзера при снятии, эта тоже не должна.
+    local function restoreFreeGunHook()
+        restoreFreeGunSeat()
         if not _canEquipHooked then return end
         if _fgMode == "field" and _fgTbl and _canEquipCallOrig then
             pcall(function() _fgTbl._canEquip = _canEquipCallOrig end)
@@ -1345,13 +1475,28 @@ return function(Lib)
         V.AmbientPreset         = name
         return true
     end
+    -- FIX v3 (перф): до 14 записей в Lighting шли КАЖДЫЙ кадр. Полный проход
+    -- теперь ~4 Гц; ClockTime — исключение, игра его анимирует, поэтому он
+    -- перебивается каждый кадр (но пишется только при реальном отличии).
+    local _lightT = -999
     local function lightingStep()
-        if V.AmbientEnabled or V.FullbrightEnabled or V.NoFogEnabled then saveLighting() end
+        local amb, fb, nofog = V.AmbientEnabled, V.FullbrightEnabled, V.NoFogEnabled
+        if not (amb or fb or nofog) then return end
+        saveLighting()
+        if amb then
+            pcall(function()
+                if Lighting.ClockTime ~= V.AmbientClockTime then
+                    Lighting.ClockTime = V.AmbientClockTime
+                end
+            end)
+        end
+        local tL = now()
+        if tL - _lightT < 0.25 then return end
+        _lightT = tL
         -- Atmosphere: полноценная кастомизация вайба (время суток, оттенки,
         -- экспозиция, туман). Раньше тут было только время + яркость.
-        if V.AmbientEnabled then
+        if amb then
             pcall(function()
-                Lighting.ClockTime  = V.AmbientClockTime
                 Lighting.Brightness = V.AmbientBrightness
                 Lighting.Ambient        = V.AmbientColor
                 Lighting.OutdoorAmbient = V.AmbientOutdoorColor
@@ -1370,7 +1515,7 @@ return function(Lib)
             end)
         end
         -- Fullbright — отдельная простая фича: просто «видно всё».
-        if V.FullbrightEnabled then
+        if fb then
             pcall(function()
                 Lighting.Brightness     = math.max(Lighting.Brightness, 2)
                 Lighting.Ambient        = FULLBRIGHT_COL
@@ -1378,12 +1523,22 @@ return function(Lib)
                 Lighting.GlobalShadows  = false
             end)
         end
-        if V.NoFogEnabled then
+        if nofog then
             pcall(function()
                 Lighting.FogEnd   = 1e9
                 Lighting.FogStart = 1e9
             end)
         end
+    end
+
+    -- FIX v3: общий off-путь Ambient/Fullbright/NoFog. Раньше его имели ТОЛЬКО
+    -- хоткеи — UI-тогглы лишь снимали флаг, lightingStep переставал писать, и
+    -- мир оставался перекрашенным насовсем. Ещё включённые соседи пере-применят
+    -- своё следующим heartbeat (_lightT сброшен → без 250мс мигания).
+    local function lightingOff()
+        restoreLighting()
+        lightSavedOK = false
+        _lightT = -999
     end
 
     ---------------------------------------------------------------------------
@@ -1412,11 +1567,22 @@ return function(Lib)
         end)
         -- сервер/игра могут переустановить Timer → держим его в 0, пока фича вкл
         if not promptAttrConn[p] then
-            promptAttrConn[p] = p:GetAttributeChangedSignal("Timer"):Connect(function()
+            local attrC = p:GetAttributeChangedSignal("Timer"):Connect(function()
                 if V.NoFWaitEnabled and p:GetAttribute("Timer") and p:GetAttribute("Timer") ~= 0 then
                     pcall(function() p:SetAttribute("Timer", 0) end)
                 end
             end)
+            -- FIX v3: промпт, уничтоженный при включённой фиче, оставлял и ключ,
+            -- и коннект НАВСЕГДА (таблица только росла). Чистим по Destroying.
+            local dstC = p.Destroying:Connect(function()
+                local rec = promptAttrConn[p]
+                promptAttrConn[p] = nil
+                if rec then
+                    pcall(function() rec[1]:Disconnect() end)
+                    pcall(function() rec[2]:Disconnect() end)
+                end
+            end)
+            promptAttrConn[p] = { attrC, dstC }
         end
     end
     local function enableNoFWait()
@@ -1428,8 +1594,9 @@ return function(Lib)
     end
     local function disableNoFWait()
         if promptConn then promptConn:Disconnect(); promptConn = nil end
-        for p, c in pairs(promptAttrConn) do
-            pcall(function() c:Disconnect() end)
+        for p, rec in pairs(promptAttrConn) do
+            pcall(function() rec[1]:Disconnect() end)
+            pcall(function() rec[2]:Disconnect() end)
             promptAttrConn[p] = nil
         end
         for _, d in ipairs(Workspace:GetDescendants()) do
@@ -1438,6 +1605,11 @@ return function(Lib)
                 if st ~= nil then pcall(function() d:SetAttribute("Timer", st) end) end
                 local s = d:GetAttribute("BRM5_hold")
                 if s ~= nil then pcall(function() d.HoldDuration = s end) end
+                -- FIX v3: маркеры-атрибуты оставались на промптах навсегда
+                pcall(function()
+                    d:SetAttribute("BRM5_timer", nil)
+                    d:SetAttribute("BRM5_hold", nil)
+                end)
             end
         end
     end
@@ -1489,26 +1661,65 @@ return function(Lib)
     -- хука это будет глобал (=nil), и Viewmodel/GunModel молча перестанут
     -- работать. Ровно та же ловушка, что была с gunHighlight.
 
+    -- FIX v3: раньше ВСЕ шаги шли в одном pcall с замыканием на кадр — первый
+    -- же упавший шаг молча (log — no-op) вырубал все последующие до конца
+    -- сессии: ошибка в vehicleStep убивала Ambient/Fullbright/NoFog/Lockpick.
+    -- Теперь pcall на КАЖДЫЙ шаг + warn, затроттленный до 1/сек на шаг.
+    local _stepWarnT = {}
+    local runStep = LPH_NO_VIRTUALIZE(function(name, fn, dt)
+        local ok, err = pcall(fn, dt)
+        if not ok then
+            local t = now()
+            if t - (_stepWarnT[name] or -999) >= 1 then
+                _stepWarnT[name] = t
+                warn("[VIS] шаг", name, "упал:", err)
+            end
+        end
+    end)
+    local function vmHookStep()
+        if V.ViewmodelEnabled or V.GunModelEnabled then ensureViewmodelHook() end
+    end
+
     -- Главный per-frame Heartbeat. Под Luraph обязан быть нативным.
     local heartbeat = LPH_NO_VIRTUALIZE(function(dt)
         if not running then return end
-        pcall(function()
-            if V.ViewmodelEnabled or V.GunModelEnabled then ensureViewmodelHook() end
-        thirdPersonStep()
-        vehicleStep(dt)
-        freeGunStep()
-            lightingStep()
-            lockpickStep()
-        end)
+        runStep("vmhook",   vmHookStep)
+        runStep("tps",      thirdPersonStep)
+        runStep("vehicle",  vehicleStep, dt)
+        runStep("freegun",  freeGunStep)
+        runStep("lighting", lightingStep)
+        runStep("lockpick", lockpickStep)
     end)
 
     ---------------------------------------------------------------------------
     -- ХОТКЕИ
     ---------------------------------------------------------------------------
     local inputConn = nil
+    -- FIX v3: MacLib сохраняет состояние ЭЛЕМЕНТОВ, а не CONFIG — хоткей,
+    -- флипавший только V.*, давал рассинхрон: SaveConfig после Numpad-тоггла
+    -- писал в конфиг ПРОТИВОПОЛОЖНОЕ значение. Синкаем элемент через
+    -- K.syncToggle. Таблица: ключ конфига → Flag его UI-тоггла.
+    local HOTKEY_UI_FLAGS = {
+        ViewmodelEnabled      = "VM",
+        GunModelEnabled       = "GM",
+        ThirdPersonEnabled    = "TP",
+        VehicleFlyEnabled     = "VehFly",
+        VehicleSpeedEnabled   = "VehSpeed",
+        FreeGunEnabled        = "FreeGun",
+        AmbientEnabled        = "Ambient",
+        NoFWaitEnabled        = "NoFWait",
+        LockpickBypassEnabled = "Lockpick",
+        FullbrightEnabled     = "Fullbright",
+        NoFogEnabled          = "NoFog",
+    }
+    local _uiKitRef, _uiFlagFn = nil, nil   -- заполняет buildUI
     local function toggle(name, label)
         V[name] = not V[name]
         log(label, V[name] and "ВКЛ" or "выкл")
+        local fl = HOTKEY_UI_FLAGS[name]
+        if _uiKitRef and _uiFlagFn and fl then
+            pcall(_uiKitRef.syncToggle, _uiFlagFn(fl), V[name])
+        end
         return V[name]
     end
 
@@ -1529,17 +1740,18 @@ return function(Lib)
         elseif kc == V.VehicleFlyKey   then toggle("VehicleFlyEnabled",    "VehicleFly")
         elseif kc == V.VehicleSpeedKey then toggle("VehicleSpeedEnabled",   "VehicleSpeed")
         elseif kc == V.FreeGunKey then
-            if toggle("FreeGunEnabled", "FreeGun") then installFreeGunHook() end
+            -- FIX v3: off-путь возвращает SeatCanEquip (раньше — только M.stop)
+            if toggle("FreeGunEnabled", "FreeGun") then installFreeGunHook() else restoreFreeGunSeat() end
         elseif kc == V.AmbientKey then
-            if not toggle("AmbientEnabled", "Ambient") then restoreLighting(); lightSavedOK = false end
+            if not toggle("AmbientEnabled", "Ambient") then lightingOff() end
         elseif kc == V.NoFWaitKey then
             if toggle("NoFWaitEnabled", "NoFWait") then enableNoFWait() else disableNoFWait() end
         elseif kc == V.LockpickBypassKey then
             toggle("LockpickBypassEnabled", "LockpickBypass")
         elseif kc == V.FullbrightKey then
-            if not toggle("FullbrightEnabled", "Fullbright") then restoreLighting(); lightSavedOK = false end
+            if not toggle("FullbrightEnabled", "Fullbright") then lightingOff() end
         elseif kc == V.NoFogKey then
-            if not toggle("NoFogEnabled", "NoFog") then restoreLighting(); lightSavedOK = false end
+            if not toggle("NoFogEnabled", "NoFog") then lightingOff() end
         end
     end
 
@@ -1552,13 +1764,25 @@ return function(Lib)
         if running then return end
         running = true
         hbConn = RunService.Heartbeat:Connect(heartbeat)
-        pcall(function()
+        -- FIX v3: при ре-инжекте прошлый бинд ещё жив → повторный BindToRenderStep
+        -- с тем же именем падал ВНУТРИ pcall молча, и зомби-степ крутился на
+        -- мёртвом конфиге. Снимаем защитно ДО бинда; неудачу бинда теперь warn-им.
+        pcall(function() RunService:UnbindFromRenderStep(FOV_BIND) end)
+        local bindOk, bindErr = pcall(function()
             RunService:BindToRenderStep(FOV_BIND,
                 Enum.RenderPriority.Camera.Value + 1, fovStep)
             fovBound = true
         end)
+        if not bindOk then warn("[VIS] FOV: BindToRenderStep не встал:", bindErr) end
+        -- FIX v3: держит FOV не бинд (см. шапку — Flux перетирает его в своём
+        -- RenderStepped), а перехват записи игры + пере-хук при смене камеры.
+        hookFovSignal()
+        _fovCamConn = Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+            _origFov = nil
+            hookFovSignal()
+        end)
         inputConn = UIS.InputBegan:Connect(onInput)
-        log("Visuals/World v2 запущен | Numpad1..0 = ту��блеры | CONFIG.Visuals для настройки")
+        log("Visuals/World v3 запущен | Numpad1..0 = ту��блеры | CONFIG.Visuals для настройки")
     end
 
     function M.stop()
@@ -1569,6 +1793,10 @@ return function(Lib)
             pcall(function() RunService:UnbindFromRenderStep(FOV_BIND) end)
             fovBound = false
         end
+        -- FIX v3: снимаем сигнал-хуки FOV ДО восстановления FieldOfView — иначе
+        -- наша же запись-восстановление триггерит applyFov и вернёт кастомный FOV.
+        if _fovConn    then _fovConn:Disconnect();    _fovConn    = nil end
+        if _fovCamConn then _fovCamConn:Disconnect(); _fovCamConn = nil end
         -- Снимаем хук ДО restore — иначе живой хук вернёт стиль обратно
         -- на следующем же кадре (ровно так и было раньше).
         unhookViewmodel()
@@ -1580,12 +1808,19 @@ return function(Lib)
         restoreSelfBody()
         restoreFreeGunHook()     -- FIX: снимаем _canEquip и возвращаем SeatCanEquip
         disableNoFWait()
-        restoreLighting(); lightSavedOK = false
-        pcall(function()
-            local cam = Workspace.CurrentCamera
-            -- FIX: было жёстко 70 — теперь возвращаем реально захваченный FOV
-            if cam then cam.FieldOfView = _origFov or 70 end
-        end)
+        lightingOff()
+        -- FIX v3: раньше FieldOfView писался БЕЗУСЛОВНО (70), даже если фича ни
+        -- разу не включалась — сбивали игровой/чужой FOV на выгрузке. Теперь
+        -- только если мы реально его меняли (или успели захватить оригинал).
+        if fovApplied or _origFov then
+            pcall(function()
+                local cam = Workspace.CurrentCamera
+                -- FIX: было жёстко 70 — теперь возвращаем реально захваченный FOV
+                if cam then cam.FieldOfView = _origFov or 70 end
+            end)
+            fovApplied = false
+            _origFov = nil
+        end
         log("Visuals/World остановлен")
     end
 
@@ -1609,6 +1844,12 @@ return function(Lib)
         local tabMisc = ui.tabs and ui.tabs.Misc
         local tabDbg  = ui.tabs and ui.tabs.Debug
         local K = Bridge.makeUiKit(ui)
+        -- FIX v3: ТОТ ЖЕ флаг-хелпер, что внутри kit (library.makeUiKit): фолбэк
+        -- обязан давать "BRM5_<имя>". Старый локальный `(ui.flag or tostring)`
+        -- при отсутствии ui.flag выдавал "VehSpeed" вместо "BRM5_VehSpeed" —
+        -- syncToggle бил мимо элемента.
+        local uiFlag = ui.flag or function(s) return "BRM5_" .. tostring(s) end
+        _uiKitRef, _uiFlagFn = K, uiFlag
 
         if tabV then
             -- ═══ Viewmodel ═════════════════════════════════════════════
@@ -1656,6 +1897,28 @@ return function(Lib)
                 Default = math.floor(V.ViewmodelDepth or 0) + 100, Min = 0, Max = 200,
                 Callback = function(v) V.ViewmodelDepth = v - 100 end,
                 Desc = "100 = stock. pulls the arms closer or pushes em away\nthis is NOT camera fov, that one lives in Misc" })
+            -- FIX v3: ViewmodelOffset/ViewmodelTilt читались хуком, а контролов
+            -- не было (шапка обещает «смещение рук»). Ось Z не дублируем — это
+            -- уже Hand Zoom выше. Слайдеры целые → в конфиг идут сотые studs.
+            local _vmo = (typeof(V.ViewmodelOffset) == "Vector3") and V.ViewmodelOffset or Vector3.zero
+            K.slider(S, { Name = "Hand Right", Flag = "VMOffX",
+                Default = math.floor(_vmo.X * 100) + 100, Min = 0, Max = 200,
+                Callback = function(v)
+                    local o = (typeof(V.ViewmodelOffset) == "Vector3") and V.ViewmodelOffset or Vector3.zero
+                    V.ViewmodelOffset = Vector3.new((v - 100) / 100, o.Y, o.Z)
+                end,
+                Desc = "100 = stock. slides the arms sideways" })
+            K.slider(S, { Name = "Hand Up", Flag = "VMOffY",
+                Default = math.floor(_vmo.Y * 100) + 100, Min = 0, Max = 200,
+                Callback = function(v)
+                    local o = (typeof(V.ViewmodelOffset) == "Vector3") and V.ViewmodelOffset or Vector3.zero
+                    V.ViewmodelOffset = Vector3.new(o.X, (v - 100) / 100, o.Z)
+                end,
+                Desc = "100 = stock. raises or drops em" })
+            K.slider(S, { Name = "Hand Tilt", Flag = "VMTilt",
+                Default = math.floor(V.ViewmodelTilt or 0) + 45, Min = 0, Max = 90, Suffix = "°",
+                Callback = function(v) V.ViewmodelTilt = v - 45 end,
+                Desc = "45 = stock. rolls the arms" })
 
             -- ═══ Gun Model ═════════════════════════════════════════════
             local G = tabV:Section({ Side = "Left" })
@@ -1790,10 +2053,11 @@ return function(Lib)
                 get = function() return V.VehicleSpeedEnabled end,
                 set = function(v) V.VehicleSpeedEnabled = v end })
             if ui.keybind then
-                ui.keybind(S, { Name = "Keybind", Flag = (ui.flag or tostring)("VehSpeed_KB"),
+                -- FIX v3: флаги через uiFlag (фолбэк kit'а), а не `or tostring`
+                ui.keybind(S, { Name = "Keybind", Flag = uiFlag("VehSpeed_KB"),
                     Toggle = function()
                         V.VehicleSpeedEnabled = not V.VehicleSpeedEnabled
-                        K.syncToggle((ui.flag or tostring)("VehSpeed"), V.VehicleSpeedEnabled)
+                        K.syncToggle(uiFlag("VehSpeed"), V.VehicleSpeedEnabled)
                         K.notify("Vehicle Speed", V.VehicleSpeedEnabled and "Enabled" or "Disabled")
                     end })
             end
@@ -1809,7 +2073,12 @@ return function(Lib)
             K.feature(S, {
                 Title = "Free Gun", Flag = "FreeGun",
                 get = function() return V.FreeGunEnabled end,
-                set = function(v) V.FreeGunEnabled = v end,
+                -- FIX v3: off-путь возвращает la.SeatCanEquip — раньше поле
+                -- игры оставалось пропатченным до самого unload (M.stop).
+                set = function(v)
+                    V.FreeGunEnabled = v
+                    if not v then restoreFreeGunSeat() end
+                end,
                 Desc = "lets u draw a weapon where the game blocks it\nlike inside a vehicle",
             })
         end
@@ -1817,17 +2086,26 @@ return function(Lib)
         -- ═══ TAB: Misc ═════════════════════════════════════════════════
         if tabMisc then
             local SL = tabMisc:Section({ Side = "Left" })
+            -- FIX v3: у всех трёх лайтинг-тогглов (Fullbright/NoFog/Atmosphere)
+            -- off-путь был только у ХОТКЕЕВ — выкл из меню оставлял мир
+            -- перекрашенным навсегда. Теперь тот же lightingOff(), что у хоткеев.
             K.feature(SL, {
                 Title = "Fullbright", Flag = "Fullbright",
                 get = function() return V.FullbrightEnabled end,
-                set = function(v) V.FullbrightEnabled = v end,
+                set = function(v)
+                    V.FullbrightEnabled = v
+                    if not v then lightingOff() end
+                end,
                 Desc = "flat max light, no shadows anywhere\nfor mood lighting use Atmosphere instead",
             })
 
             K.group(SL, "No Fog")
             K.toggle(SL, { Name = "Enabled", Flag = "NoFog", Title = "No Fog",
                 get = function() return V.NoFogEnabled end,
-                set = function(v) V.NoFogEnabled = v end,
+                set = function(v)
+                    V.NoFogEnabled = v
+                    if not v then lightingOff() end
+                end,
                 Desc = "strips fog entirely — see the whole map" })
 
             K.group(SL, "Camera FOV")
@@ -1845,7 +2123,10 @@ return function(Lib)
             K.feature(SA, {
                 Title = "Atmosphere", Flag = "Ambient",
                 get = function() return V.AmbientEnabled end,
-                set = function(v) V.AmbientEnabled = v end,
+                set = function(v)
+                    V.AmbientEnabled = v
+                    if not v then lightingOff() end
+                end,
                 Desc = "ur own time of day n mood\noverrides whatever the map sets",
             })
             -- Пресет ставит всю атмосферу разом. Ползунки ниже остаются
@@ -1864,8 +2145,14 @@ return function(Lib)
                 end,
                 Desc = "ready-made vibes\ntweak anything below n it flips to Custom" })
 
-            -- Любое ручное изменение сбрасывает пресет в Custom
-            local function manual() V.AmbientPreset = "Custom" end
+            -- Любое ручное изменение сбрасывает пресет в Custom.
+            -- FIX v3: _ambSync — ambRefresh дёргает UpdateState/UpdateValue, а
+            -- MacLib синхронно эхает колбэки; без гейта только что выбранный
+            -- пресет тут же слетал бы в Custom.
+            local _ambSync = false
+            local function manual()
+                if not _ambSync then V.AmbientPreset = "Custom" end
+            end
 
             local elTime = K.slider(SA, { Name = "Time", Flag = "ClockTime",
                 Default = V.AmbientClockTime, Min = 0, Max = 24, Suffix = "h",
@@ -1898,14 +2185,16 @@ return function(Lib)
             local elTintB = K.color(SA, { Name = "Shade Tint", Flag = "AmbTintBottom",
                 Default = V.AmbientTintBottom,
                 Callback = function(c) V.AmbientTintBottom = c; manual() end })
+            -- FIX v3: manual() — раньше правка Shadows/Custom Fog не переводила
+            -- пресет в Custom, в отличие от всех остальных контролов атмосферы.
             local elShadows = K.toggle(SA, { Name = "Shadows", Flag = "AmbShadows", Title = "Shadows",
                 get = function() return V.AmbientShadows ~= false end,
-                set = function(v) V.AmbientShadows = v end })
+                set = function(v) V.AmbientShadows = v; manual() end })
 
             K.group(SA, "Fog")
             local elFogOn = K.toggle(SA, { Name = "Custom Fog", Flag = "AmbFogOn", Title = "Custom Fog",
                 get = function() return V.AmbientFogEnabled end,
-                set = function(v) V.AmbientFogEnabled = v end,
+                set = function(v) V.AmbientFogEnabled = v; manual() end,
                 Desc = "for haze n distance mood\nuse No Fog instead if u just want it gone" })
             local elFogCol = K.color(SA, { Name = "Fog Color", Flag = "AmbFogColor",
                 Default = V.AmbientFogColor,
@@ -1920,6 +2209,7 @@ return function(Lib)
             -- Пресет меняет V.*, но ползунки/пикеры об этом не знают —
             -- синхронизируем их отображение, иначе они по��азывают старые числа.
             ambRefresh = function()
+                _ambSync = true   -- FIX v3: эхо UpdateState не должно звать manual()
                 local function setV(el, val)
                     if el and val then pcall(function() el:UpdateValue(val, true) end) end
                 end
@@ -1939,13 +2229,20 @@ return function(Lib)
                 setC(elFogCol,  V.AmbientFogColor)
                 if elShadows then pcall(function() elShadows:UpdateState(V.AmbientShadows ~= false) end) end
                 if elFogOn   then pcall(function() elFogOn:UpdateState(V.AmbientFogEnabled == true) end) end
+                _ambSync = false
             end
 
             local SIN = tabMisc:Section({ Side = "Right" })
             SIN:Header({ Name = "Interactions" })
+            -- FIX v3: сеттер лишь ставил флаг, а оба читателя живут в коннектах,
+            -- которые создаёт enableNoFWait() — её звал ТОЛЬКО хоткей Num7.
+            -- Из меню фича была полностью мёртвой.
             K.toggle(SIN, { Name = "No Prompt Hold", Flag = "NoFWait", Title = "No Prompt Hold",
                 get = function() return V.NoFWaitEnabled end,
-                set = function(v) V.NoFWaitEnabled = v end,
+                set = function(v)
+                    V.NoFWaitEnabled = v
+                    if v then enableNoFWait() else disableNoFWait() end
+                end,
                 Desc = "prompts fire instantly instead of holding F" })
             K.toggle(SIN, { Name = "Lockpick Bypass", Flag = "Lockpick", Title = "Lockpick Bypass",
                 get = function() return V.LockpickBypassEnabled end,
@@ -1961,6 +2258,11 @@ return function(Lib)
                 Default = math.floor((V.LockpickScanInterval or 0.4) * 1000),
                 Min = 100, Max = 2000, Suffix = " ms",
                 Callback = function(v) V.LockpickScanInterval = v / 1000 end })
+            K.slider(D, { Name = "Restyle Period", Flag = "DbgVmRestyle",
+                Default = math.floor((V.VmRestyleSec or 3) * 1000),
+                Min = 500, Max = 10000, Suffix = " ms",
+                Callback = function(v) V.VmRestyleSec = v / 1000 end,
+                Desc = "how often late arm/gun parts get repainted" })
         end
 
         K.ready()
