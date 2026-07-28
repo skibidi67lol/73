@@ -1,4 +1,59 @@
 --[[
+	BRM5ESP_v13 — CHANGELOG от v12:
+
+	FIX 1 — Имена нельзя было выключить (тоггла не существовало):
+	  Новый CONFIG.EspShowName + тоггл "Names" (группа Text). Сам текст режет
+	  library (formatEspLabelWithDistance → "" при EspShowName=false), esp гасит
+	  Drawing при пустом лейбле. Label-only NPC при выключенных именах
+	  скрываются целиком, зомби-кластеры не строятся.
+
+	FIX 2 — Выключение ESP замораживало всё нарисованное:
+	  `if not CONFIG.ESP then return end` стоял в Heartbeat ДО updateESP —
+	  единственный hide-путь (hideAllEspDrawings) был недостижимым мёртвым
+	  кодом. Теперь off-переход гасится ровно один раз (espWasOn), UI-тоггл
+	  дёргает start()/stop(), _M.toggle() синхронизирует CONFIG.ESP и UI-тоггл.
+	  Кластерные entry снимают _hidden при отрисовке (были невыключаемыми).
+
+	FIX 3 — SilentAim не работал без ESP:
+	  Синхронизация реестра акторов (_refreshActorsForEsp / refreshActorSquads /
+	  full-rescan) вынесена НАД гейт CONFIG.ESP — State.actors кормится всегда,
+	  пока модуль запущен. Троттлы library (lastRepSyncBatch/lastSquadRefresh)
+	  не тронуты — самопривод silentaim работу не дублирует.
+
+	FIX 4 — Загрузка модуля затирала чужой CONFIG:
+	  pairs(ESP_CONFIG)→CONFIG теперь fill-only-missing (как давно в start()).
+
+	FIX 5 — Флаг "Distance" остаётся за ESP (killaura переезжает на KADistance).
+
+	FIX 6 — Труп игрока (class=="dead") не гасил скелет/extra-тексты —
+	  застывали поверх трупа. Гасим как в ветке dead-флага (+ плечевая линия).
+
+	FIX 7 — Guard espRankBusy делал return из ВСЕГО updateESP — терялся целый
+	  draw-кадр (visible-батч, отрисовка, гашение исчезнувших). Теперь guard
+	  не выходит, таймеры двигаются только при реальном старте пересборки;
+	  3s-страховка от залипания сохранена.
+
+	FIX 8 — Zombie-кластерные entry никогда не удалялись (утечка ~37 Drawing
+	  на каждый новый квантованный ключ). buildZombieCluster публикует живой
+	  набор в State._espLiveClusters, cleanupEspCache ретирует остальные;
+	  кэш кластеров сбрасывается при выключении фичи.
+
+	FIX 9 — Диагностический поллер (Debug) жил вечно после stop(). Теперь
+	  умирает с модулем (_M._uiAlive), start() поднимает его заново.
+
+	PERF — ViewportSize читается раз в кадр (не на актора); espVisibleCache
+	  мутируется in-place (не таблица на NPC за тик); адаптивный renderInterval
+	  теперь clamp (не перетирает Debug-слайдер); scratch-таблицы в
+	  drawEspStatusBar/drawEspExtraLines; playerNear считается при пересборке
+	  ranked, а не O(N)-сканом каждый кадр.
+
+	CLEANUP — мёртвый local flag в buildUI удалён; State.espVisibleBatchIndex
+	  удалён (clearAllEspDrawings сбрасывает espVisibleCursor — то, что и
+	  задумывалось); "circle" убран из ESP_ENTRY_SINGLE (не создаётся нигде).
+	  Латентный баг: _M.toggle ссылался на _M внутри конструктора таблицы
+	  (там это глобальный nil) — _M теперь объявляется заранее.
+]]
+--[[
 	BRM5ESP_v12 — CHANGELOG от v11:
 
 	FIX 1 — Зависание ESP на пару фреймов:
@@ -102,6 +157,7 @@ local ESP_CONFIG = {
 	EspVisibleInterval    = 0.35,
 	EspVisibleCheckNpc    = false,
 	EspShowDistance       = true,
+	EspShowName           = true,  -- v13: имена акторов (текст режет library, esp гасит Drawing)
 	EspNpcNameOnly        = true,
 	EspSkeletonMaxActors  = 24,       -- скелет только для топ-N по дистанции (игроки приоритет)
 	EspSkeletonMaxDist    = 800,      -- скелет до 800 studs
@@ -133,7 +189,10 @@ local ESP_CONFIG = {
 	ActorEnrichBatchSize  = 4,        -- итоговое значение (было переопределено дважды)
 	DrawingHighTransparencyMeansVisible = true,
 }
-for k,v in pairs(ESP_CONFIG) do CONFIG[k] = v end
+-- FIX v13: было безусловное CONFIG[k] = v — затирало ключи, которые другой
+-- модуль или автозагруженный MacLib-конфиг уже успел выставить, и обесценивало
+-- такой же nil-guard в start(). Теперь только заполняем недостающие.
+for k,v in pairs(ESP_CONFIG) do if CONFIG[k] == nil then CONFIG[k] = v end end
 
 local SKELETON_R15 = {
 	{"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
@@ -165,12 +224,21 @@ State.drawings        = State.drawings        or {}
 State.espHighlights   = State.espHighlights   or {}
 State.espVisibleCache = State.espVisibleCache or {}
 State.espRanked       = nil
-State.espVisibleBatchIndex = 0
+-- v13: State.espVisibleBatchIndex удалён — писался в двух местах, не читался нигде.
 State.lastEspUpdate   = 0
 State.espRankedTime   = 0
 State.espLastActorCount = -1
 
 local espConn = nil
+-- FIX v13: был ли ESP включён на прошлом кадре Heartbeat — off-переход гасит
+-- Drawing-объекты ровно один раз (см. рестракт Heartbeat в start()).
+local espWasOn = false
+-- FIX v13: ссылки для _M.toggle() — синхронизация UI-тоггла из хоткея.
+-- Ставятся в buildUI; до постройки UI остаются nil (тоггл работает и без них).
+local uiKit = nil
+local espFeature = nil
+-- FIX v13: респавнер диагностического поллера (ставится в buildUI, дёргается из start()).
+local diagRespawn = nil
 local tableField     = Bridge._tableField
 local ESP_BOX_PARTS  = {
 	"Head", "UpperTorso", "LowerTorso",
@@ -1249,11 +1317,20 @@ function Bridge.hideEspExtraTexts(entry)
 	end
 end
 
+-- FIX v13 (perf): scratch-таблицы вместо аллокаций на каждого актора каждый
+-- кадр. Безопасно: оба потребителя (drawEspExtraLines/drawEspStatusBar)
+-- вызываются только синхронно из draw-цикла updateESP, без yield и вложенности.
+local _extraLinesScratch  = {}
+local _extraColorsScratch = {}
+local _statusScratch      = {}
+
 function Bridge.drawEspExtraLines(entry, rect, data, startY, labelSize)
 	if not entry or not rect then return startY end
 	local texts = Bridge.ensureEspExtraTexts(entry)
-	local lines = {}
-	local colors = {}
+	local lines = _extraLinesScratch
+	local colors = _extraColorsScratch
+	table.clear(lines)
+	table.clear(colors)
 	labelSize = labelSize or ESP_LABEL_SIZE
 
 	if CONFIG.EspShowSecondary and data and data.espSecondaryName then
@@ -1308,7 +1385,9 @@ function Bridge.drawEspStatusBar(entry, rect, data, afterY, labelSize)
 		return
 	end
 	local getEntries = Bridge.getActorStatusEntriesCached or Bridge.getActorStatusEntries
-	local entries = {}
+	-- FIX v13 (perf): scratch вместо таблицы на каждого актора каждый кадр.
+	local entries = _statusScratch
+	table.clear(entries)
 	for _, e in ipairs(getEntries(data)) do
 		if not e.text or e.text == "Armed" then continue end
 		if e.kind == "stance" and CONFIG.EspShowStance == false then
@@ -1497,8 +1576,10 @@ end
 -- Теперь список полей ОДИН. Добавляешь новый Drawing в entry — дописываешь
 -- сюда, и он гарантированно чистится на всех путях.
 -- ─────────────────────────────────────────────────────────────────────────
+-- v13: "circle" удалён — такой Drawing нигде не создаётся, hideEspEntry его
+-- тоже не знает; мёртвый ключ только путал при сверке списков.
 local ESP_ENTRY_SINGLE = {
-	"skelShoulderLine", "skelHeadCircle", "circle", "text",
+	"skelShoulderLine", "skelHeadCircle", "text",
 	"statusText", "weaponText", "weaponBg", "statusBg",
 	"hpBg", "hpFill", "hpOutline",
 }
@@ -1547,9 +1628,17 @@ function Bridge.cleanupEspCache()
 		-- записи сносило каждые 5 секунд и пересоздавало на следующем кадре
 		-- (36 Drawing.new за раз). Кластерные ключи пропускаем, их жизненный
 		-- цикл ведёт сам построитель кластеров.
+		-- FIX v13: «ведёт сам построитель» было неправдой — buildZombieCluster
+		-- никогда не ретирил старые ключи, каждый новый квантованный uid
+		-- аллоцировал вечную пачку Drawing. Теперь построитель публикует живой
+		-- набор (State._espLiveClusters), всё вне набора — под снос.
 		local isCluster = type(uid) == "string"
 			and (uid:sub(1, 3) == "zc:" or uid:sub(1, 9) == "zcluster_")
-		if not isCluster and (not actors or not actors[uid]) then
+		if isCluster then
+			if not (State._espLiveClusters and State._espLiveClusters[uid]) then
+				toRemove[#toRemove + 1] = uid
+			end
+		elseif not actors or not actors[uid] then
 			toRemove[#toRemove + 1] = uid
 		end
 	end
@@ -1611,7 +1700,9 @@ function Bridge.clearAllEspDrawings()
 	State.espLastActorCount = -1
 	State.espRankedTime = 0
 	State.espVisibleCache = {}
-	State.espVisibleBatchIndex = 0
+	-- v13: тут сбрасывался мёртвый espVisibleBatchIndex. Код имел в виду курсор
+	-- round-robin видимости — сбрасываем его: новый ranked начнётся с начала.
+	State.espVisibleCursor = 1
 	-- Гасим СИНХРОННО и сразу: это дешёвая запись Visible=false, зато экран
 	-- чист в этом же кадре. Дорогое уничтожение объектов — в defer.
 	for _, entry in pairs(oldDrawings) do
@@ -1721,6 +1812,14 @@ function Bridge.buildZombieCluster(ranked, cam, now)
 		end
 	end
 
+	-- FIX v13: публикуем живой набор кластерных uid — cleanupEspCache ретирит
+	-- все кластерные entry вне этого набора (раньше они копились вечно).
+	local liveClusters = {}
+	for _, cl in ipairs(clusters) do
+		liveClusters[cl.uid] = true
+	end
+	State._espLiveClusters = liveClusters
+
 	_zombieClusterCache = { clusters = clusters, clustered = assigned }
 	_zombieClusterT = now
 	return _zombieClusterCache
@@ -1763,19 +1862,26 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 	end
 	local npcCount = cachedNpcCount()
 	local renderInterval = CONFIG.EspRenderInterval or 0.0167
+	-- FIX v13: адаптив раньше ПЕРЕТИРАЛ интервал — Debug-слайдер (Render
+	-- Interval) молча игнорировался при 4+ NPC. Теперь только замедляем (clamp).
+	local adaptive = 0
 	if npcCount >= 15 or actorCount > 200 then
-		renderInterval = 0.033
+		adaptive = 0.033
 	elseif npcCount >= 8 or actorCount > 100 then
-		renderInterval = 0.025
+		adaptive = 0.025
 	elseif npcCount >= 4 then
-		renderInterval = 0.02
+		adaptive = 0.02
 	end
+	renderInterval = math.max(renderInterval, adaptive)
 	if now - (State.lastEspUpdate or 0) < renderInterval then return end
 	State.lastEspUpdate = now
 
 	local cam = workspace.CurrentCamera
 	if not cam then return end
 	local camPos = cam.CFrame.Position
+	-- FIX v13 (perf): ViewportSize читался на КАЖДОГО актора в offscreen-чеке.
+	local vpSize = cam.ViewportSize
+	local vpX, vpY = vpSize.X, vpSize.Y
 
 	-- FIX flicker: никогда не прячем ESP из-за actorCount==0 —
 	-- trackedActorCount может быть 0 на кадр пересборки.
@@ -1791,15 +1897,19 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 	-- FIX v12: ranked-пересборка вынесена в defer чтобы НЕ блокировать draw-кадр.
 	-- Нет жёсткого ли��ита акторов — игроки всегда первыми, затем NPC по дистанции.
 	-- Пер��сборка триггерится при измене��ии actorCount или раз в 1.5s.
-	if (actorCount ~= (State.espLastActorCount or -1)) or (now - (State.espRankedTime or 0) > 1.5) then
+	-- Защита: если предыдущая пересборка ещё не финишировала (или упала),
+	-- не запускаем вторую поверх — иначе они дублируют работу и мешают
+	-- друг другу публиковать результат.
+	-- FIX v13: guard был `return` — выкидывал ВЕСЬ updateESP (visible-батч,
+	-- отрисовку, гашение исчезнувших), т.е. пересборка стоила целый draw-кадр.
+	-- Теперь guard не выходит, а таймеры двигаются только при реальном старте
+	-- пересборки — busy-кадр не проглатывает триггер.
+	if ((actorCount ~= (State.espLastActorCount or -1)) or (now - (State.espRankedTime or 0) > 1.5))
+		and not State.espRankBusy then
 		State.espRankedTime     = now
 		State.espLastActorCount = actorCount
 		local capturedActors = State.actors
 		local capturedCamPos = camPos
-		-- Защита: если предыдущая пересборка ещё не финишировала (или упала),
-		-- не запускаем вторую поверх — иначе они дублируют работу и мешают
-		-- друг другу публиковать результат.
-		if State.espRankBusy then return end
 		State.espRankBusy = true
 		-- Страховка от залипания флага: если пересборка почему-то не дошла до
 		-- конца (исключение внутри defer), через 3с разрешаем новую попытку —
@@ -1837,6 +1947,16 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 			-- Приоритет: игроки (ближние) → NPC (ближние)
 			table.sort(players, function(a, b) return a.dist < b.dist end)
 			table.sort(npcs,    function(a, b) return a.dist < b.dist end)
+			-- FIX v13 (perf): playerNear (для батч-бюджета visible-check) считается
+			-- здесь: состав/дистанции ranked меняются только при пересборке, а
+			-- раньше visible-батч O(N)-сканировал весь список каждый кадр.
+			local playerNear = 0
+			for _, row in ipairs(players) do
+				if row.dist < (CONFIG.EspVisiblePlayerDist or 500) then
+					playerNear += 1
+				end
+			end
+			State.espRankedPlayerNear = playerNear
 			local ranked = players
 			for i = 1, #npcs do ranked[#ranked + 1] = npcs[i] end
 			-- FIX: было `if #ranked > 0`. Если все акторы исчезли (конец матча,
@@ -1875,15 +1995,9 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 		local visN = 0
 		local batchSize = CONFIG.EspBatchSize or 4
 		local n = #ranked
-		local playerNear = 0
-		for _, row in ipairs(ranked) do
-			if row.data and not Bridge.isNpcActorClass(row.data.class) then
-				local d = row.dist or 0
-				if d < (CONFIG.EspVisiblePlayerDist or 500) then
-					playerNear += 1
-				end
-			end
-		end
+		-- FIX v13 (perf): O(N)-скан по ranked каждый кадр заменён значением,
+		-- посчитанным один раз при пересборке ranked (см. rank-defer выше).
+		local playerNear = State.espRankedPlayerNear or 0
 		if playerNear >= 8 then
 			batchSize = 1
 		elseif playerNear >= 4 then
@@ -1907,7 +2021,15 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 						local uid = row.uid
 						if uid and uid ~= "" then
 							State.espVisibleCache = State.espVisibleCache or {}
-							State.espVisibleCache[uid] = { v = true, t = now }
+							-- FIX v13 (perf): не аллоцируем таблицу на каждый тик —
+							-- мутируем уже существующую запись кэша.
+							local vc = State.espVisibleCache[uid]
+							if vc then
+								vc.v = true
+								vc.t = now
+							else
+								State.espVisibleCache[uid] = { v = true, t = now }
+							end
 						end
 					else
 						local dist = row.dist or 0
@@ -1935,15 +2057,20 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 	local drawnN = 0
 
 	-- FIX v12: Zombie Cluster — кластерные лейблы (opt-in: EspZombieCluster)
+	-- FIX v13: + гейт EspShowName — кластерный лейбл это и есть имя.
 	local clusterData = nil
 	local clusteredUids = {}  -- uid-ы зомби вошедших в кластер (пропускаем в draw-цикле)
-	if CONFIG.EspZombieCluster and CONFIG.EspShowZombie ~= false then
+	if CONFIG.EspZombieCluster and CONFIG.EspShowZombie ~= false and CONFIG.EspShowName ~= false then
 		clusterData = Bridge.buildZombieCluster(ranked, cam, now)
 		if clusterData then
 			clusteredUids = clusterData.clustered or {}
 			-- Рисуем кластерные лейблы
 			for _, cl in ipairs(clusterData.clusters) do
 				local clEntry = Bridge.ensureEspDrawing(cl.uid)
+				-- FIX v13: снимаем флаг скрытия, как делают все остальные
+				-- draw-пути — иначе hideEspEntry (ранний выход по _hidden)
+				-- больше никогда не погасил бы кластерную запись.
+				clEntry._hidden = false
 				live[cl.uid] = true
 				clEntry.text.Text     = tostring(cl.count) .. "x Zombies"
 				clEntry.text.Color    = ESP_COLORS.zombie
@@ -1964,6 +2091,11 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 				Bridge.hideEspStatusBar(clEntry)
 			end
 		end
+	elseif _zombieClusterCache then
+		-- FIX v13: фича выключена — сбрасываем кэш строк кластеров и живой
+		-- набор, иначе старые кластерные entry вечно защищены от cleanupEspCache.
+		_zombieClusterCache = nil
+		State._espLiveClusters = nil
 	end
 
 	for i, row in ipairs(ranked) do
@@ -2021,6 +2153,12 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 			else
 				Bridge.hideEspEntry(entry, "dead_no_rect")
 			end
+			-- FIX v13: скелет и extra-тексты не гасились (в отличие от ветки
+			-- dead-флага ниже) — застывали поверх трупа игрока.
+			if entry.skelLines then for _, ln in ipairs(entry.skelLines) do ln.Visible = false end end
+			if entry.skelHeadCircle then entry.skelHeadCircle.Visible = false end
+			if entry.skelShoulderLine then entry.skelShoulderLine.Visible = false end
+			Bridge.hideEspExtraTexts(entry)
 			if entry.hpBg      then entry.hpBg.Visible      = false end
 			if entry.hpFill    then entry.hpFill.Visible    = false end
 			if entry.hpOutline then entry.hpOutline.Visible = false end
@@ -2057,6 +2195,8 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 				-- прячем всё лишнее, оставляя только текст+бокс
 				if entry.skelLines then for _, ln in ipairs(entry.skelLines) do ln.Visible = false end end
 				if entry.skelHeadCircle then entry.skelHeadCircle.Visible = false end
+				-- FIX v13: плечевая линия тоже (единственная, что тут не гасилась)
+				if entry.skelShoulderLine then entry.skelShoulderLine.Visible = false end
 				if entry.hpBg      then entry.hpBg.Visible      = false end
 				if entry.hpFill    then entry.hpFill.Visible    = false end
 				if entry.hpOutline then entry.hpOutline.Visible = false end
@@ -2080,6 +2220,13 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 
 		local npcNameOnly = Bridge.isNpcActorClass(data.class) and CONFIG.EspNpcNameOnly == true
 		if npcNameOnly then
+			-- FIX v13: имена выключены — у label-only NPC рисовать больше нечего,
+			-- гасим запись целиком и идём дальше.
+			if CONFIG.EspShowName == false then
+				Bridge.hideEspEntry(entry, "names_off")
+				Bridge.removeEspChams(uid)
+				continue
+			end
 			-- FIX FPS: этот блок гасил ~35 объектов на КАЖДОГО NPC КАЖДЫЙ кадр,
 			-- хотя они скрыты с момента создания записи. На карте с 40 NPC это
 			-- ~1400 лишних записей в кадр. Гасим только при ВХОДЕ в режим.
@@ -2108,12 +2255,19 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 			end
 			entry._hidden = false   -- запись снова на экране
 			local boxColor = Bridge.getEspColor(data, Bridge.getEspActorVisible(uid))
-			entry.text.Text = Bridge.formatEspLabelWithDistance(data, camPos)
-			entry.text.Color = boxColor
-			entry.text.Size = ESP_LABEL_SIZE + 1
-			Bridge.showDrawing(entry.text, 1)
-			-- FIX v12: позиционируем по nPt.sp (от computeNpcLabelPoint) а не nRect
-			entry.text.Position = Vector2.new(nPt.sp.X, nPt.sp.Y - (ESP_LABEL_SIZE + 3))
+			local label = Bridge.formatEspLabelWithDistance(data, camPos)
+			-- FIX v13: library режет имя при EspShowName=false — пустой лейбл
+			-- гасим, а не рендерим пустой Text-объект.
+			if label == nil or label == "" then
+				entry.text.Visible = false
+			else
+				entry.text.Text = label
+				entry.text.Color = boxColor
+				entry.text.Size = ESP_LABEL_SIZE + 1
+				Bridge.showDrawing(entry.text, 1)
+				-- FIX v12: позиционируем по nPt.sp (от computeNpcLabelPoint) а не nRect
+				entry.text.Position = Vector2.new(nPt.sp.X, nPt.sp.Y - (ESP_LABEL_SIZE + 3))
+			end
 			continue
 		end
 
@@ -2138,9 +2292,9 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 		if Bridge.perfEnd then Bridge.perfEnd("esp.box", boxT) end
 
 		local rect = entry._boxRect
-		-- hide если off-screen или вне экрана
-		if not rect or rect.maxX < 0 or rect.minX > cam.ViewportSize.X
-			or rect.maxY < 0 or rect.minY > cam.ViewportSize.Y then
+		-- hide если off-screen или вне экрана (vpX/vpY хойстнуты в начале кадра)
+		if not rect or rect.maxX < 0 or rect.minX > vpX
+			or rect.maxY < 0 or rect.minY > vpY then
 			Bridge.hideEspEntry(entry, "offscreen")
 			Bridge.removeEspChams(uid)
 			continue
@@ -2206,19 +2360,25 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 		end
 
 		local label = Bridge.formatEspLabelWithDistance(data, camPos)
-		entry.text.Text = label
-		entry.text.Color = boxColor
-		entry.text.Size = labelSize + 1
-		Bridge.showDrawing(entry.text, 1)
-		-- FIX v12.2: rect.minY теперь = ИСТИННАЯ вершина головы (см. computeEspBoundsBox),
-		-- поэтому лейбл ставится фиксированным малым зазором выше — без прежнего
-		-- headRadius-хака, из-за которого текст «уползал» вверх с дистанцией.
-		local topAnchor = rect.headTopY or rect.minY
-		local labelAboveOffset = labelSize + 4
-		entry.text.Position = Vector2.new(
-			rect.minX + (rect.maxX - rect.minX) * 0.5,
-			topAnchor - labelAboveOffset
-		)
+		-- FIX v13: library режет имя при EspShowName=false (может вернуть "" или
+		-- только дистанцию) — пустой лейбл гасим, а не рендерим пустой Text.
+		if label == nil or label == "" then
+			entry.text.Visible = false
+		else
+			entry.text.Text = label
+			entry.text.Color = boxColor
+			entry.text.Size = labelSize + 1
+			Bridge.showDrawing(entry.text, 1)
+			-- FIX v12.2: rect.minY теперь = ИСТИННАЯ вершина головы (см. computeEspBoundsBox),
+			-- поэтому лейбл ставится фиксированным малым зазором выше — без прежнего
+			-- headRadius-хака, из-за которого текст «уползал» вверх с дистанцией.
+			local topAnchor = rect.headTopY or rect.minY
+			local labelAboveOffset = labelSize + 4
+			entry.text.Position = Vector2.new(
+				rect.minX + (rect.maxX - rect.minX) * 0.5,
+				topAnchor - labelAboveOffset
+			)
+		end
 		if CONFIG.EspActorStatus then
 			Bridge.drawEspStatusBar(entry, rect, data, stackY, labelSize)
 		else
@@ -2246,122 +2406,172 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 end)
 
 
-local _M = {
-	start = function()
-		if espConn then return end
-		-- v20 PATCH: не перезаписывать CONFIG ключи которые уже были установлены
-		-- (Silent/Library могут выставить свои значения до вызова start())
-		for k,v in pairs(ESP_CONFIG) do
-			if CONFIG[k] == nil then CONFIG[k] = v end
+-- FIX v13 (латентный баг): _M объявлялся как `local _M = { toggle = ... }`, а
+-- toggle внутри конструктора ссылался на _M — в этот момент локаль ещё НЕ в
+-- области видимости (лексика Lua), имя резолвилось в глобальный nil. Объявляем
+-- таблицу заранее, поля вешаем после — самоссылки работают.
+local _M = {}
+
+_M.start = function()
+	if espConn then return end
+	-- v20 PATCH: не перезаписывать CONFIG ключи которые уже были установлены
+	-- (Silent/Library могут выставить свои значения до вызова start())
+	for k,v in pairs(ESP_CONFIG) do
+		if CONFIG[k] == nil then CONFIG[k] = v end
+	end
+	if type(Bridge.tickRepSyncBatch) == "function" then
+		task.defer(function()
+			Bridge.tickRepSyncBatch(16)
+		end)
+	end
+	-- FIX (долгий фриз при запуске): таймеры инициализировались нулями, а
+	-- сравнение вида `t - tFull >= interval` при t = os.clock() (это
+	-- время с запуска ИГРЫ, десятки-тысячи секунд) истинно СРАЗУ. Поэтому
+	-- на ПЕРВОМ кадре разом выполнялись полный рескан + cleanup + enrich +
+	-- пересчёт команд, и всё это до того, как кэши прогрелись.
+	-- Стартуем от текущего времени: каждая тяжёлая ветка ждёт свой интервал.
+	local t0 = os.clock()
+	local tFull = t0; local tGc = t0; local tEnrich = t0; local tSquad = t0
+	-- per-frame ESP Heartbeat. Под Luraph — нативным (LPH_NO_VIRTUALIZE).
+	espConn = game:GetService("RunService").Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
+		local t = os.clock()
+
+		-- FIX v13: реестр акторов синхронизируется ВСЕГДА, пока модуль запущен:
+		-- State.actors читают SilentAim и KillAura, а единственный периодический
+		-- драйвер (_refreshActorsForEsp) жил под флагом CONFIG.ESP — без ESP
+		-- прицел оставался без целей. Троттлы внутри library
+		-- (State.lastRepSyncBatch / State.lastSquadRefresh) не дают дублировать
+		-- работу с самоприводом silentaim.
+		local actorN = State.trackedActorCount or 0
+		local npcN = cachedNpcCount()
+		local enrichInterval = 0.15
+		if npcN >= 15 or actorN > 200 then
+			enrichInterval = 0.35
+		elseif npcN >= 8 or actorN > 100 then
+			enrichInterval = 0.28
+		elseif npcN >= 4 then
+			enrichInterval = 0.22
 		end
-		if type(Bridge.tickRepSyncBatch) == "function" then
-			task.defer(function()
-				Bridge.tickRepSyncBatch(16)
-			end)
+		if t - tEnrich >= enrichInterval and type(Bridge._refreshActorsForEsp) == "function" then
+			tEnrich = t
+			local refreshT = Bridge.perfBegin and Bridge.perfBegin() or nil
+			Bridge._refreshActorsForEsp()
+			if Bridge.perfEnd then Bridge.perfEnd("esp.refresh.call", refreshT) end
 		end
-		-- FIX (долгий фриз при запуске): таймеры инициализировались нулями, а
-		-- сравнение вида `t - tFull >= interval` при t = os.clock() (это
-		-- время с запуска ИГРЫ, десятки-тысячи секунд) истинно СРАЗУ. Поэтому
-		-- на ПЕРВОМ кадре разом выполнялись полный рескан + cleanup + enrich +
-		-- пересчёт команд, и всё это до того, как кэши прогрелись.
-		-- Стартуем от текущего времени: каждая тяжёлая ветка ждёт свой интервал.
-		local t0 = os.clock()
-		local tFull = t0; local tGc = t0; local tEnrich = t0; local tSquad = t0
-		-- per-frame ESP Heartbeat. Под Luraph — нативным (LPH_NO_VIRTUALIZE).
-		espConn = game:GetService("RunService").Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
-			local t = os.clock()
-			if not CONFIG.ESP then return end
-			local actorN = State.trackedActorCount or 0
-			local npcN = cachedNpcCount()
-			local enrichInterval = 0.15
-			if npcN >= 15 or actorN > 200 then
-				enrichInterval = 0.35
-			elseif npcN >= 8 or actorN > 100 then
-				enrichInterval = 0.28
-			elseif npcN >= 4 then
-				enrichInterval = 0.22
+		-- FIX (ESP «зависал» на пару секунд): раньше здесь по таймеру
+		-- вызывался clearESP() — он сносил ВСЕ Drawing-объекты сразу.
+		-- Экран на кадр пустел, а потом заново создавались десятки
+		-- Drawing в одном кадре → видимый ступор, и всё это ради сборки
+		-- мусора, которую и так делает cleanupEspCache каждые 5 сек.
+		-- Теперь полный рескан только инвалидирует КЭШИ, не трогая
+		-- отрисовку: мёртвые записи уберёт cleanupEspCache, живые
+		-- просто перерисуются на следующем кадре — без моргания.
+		if t - tFull >= (CONFIG.EspFullRescanInterval or 60) then
+			tFull = t
+			-- FIX (ESP «застывает на пару секунд»): раньше здесь стояло
+			-- State.espRanked = nil. Дальше в updateESP есть ранний выход
+			-- «ranked пустой → пропускаем кадр», и он срабатывал ДО всей
+			-- отрисовки. Пересборка ranked идёт в task.defer и может занять
+			-- несколько кадров — всё это время ESP не обновлялся вообще, а
+			-- Drawing-объекты оставались с прошлыми координатами. Выглядело
+			-- ровно как «замерло перед сканом».
+			-- Теперь ranked НЕ трогаем: сбрасываем только счётчик, чтобы
+			-- пересборка стартовала, а рисуем по старому списку до её
+			-- окончания. Мёртвые строки отфильтровываются в самом цикле.
+			State.espLastActorCount = -1
+			Bridge.invalidateReplicatorCache()
+			Bridge.cleanupEspCache()
+		end
+		-- Состав команд: держим синхронно с library (там же дефолт 3с),
+		-- чтобы после нового матча союзники не висели красными.
+		if t - tSquad >= (CONFIG.SquadRefreshInterval or 3) then
+			tSquad = t
+			if type(Bridge.refreshActorSquads) == "function" then
+				pcall(Bridge.refreshActorSquads)
 			end
-			if t - tEnrich >= enrichInterval and type(Bridge._refreshActorsForEsp) == "function" then
-				tEnrich = t
-				local refreshT = Bridge.perfBegin and Bridge.perfBegin() or nil
-				Bridge._refreshActorsForEsp()
-				if Bridge.perfEnd then Bridge.perfEnd("esp.refresh.call", refreshT) end
+		end
+
+		-- Ниже — только визуал.
+		-- FIX v13: раньше `if not CONFIG.ESP then return end` стоял ПЕРВОЙ
+		-- строкой Heartbeat — до updateESP, где живёт единственный hide-путь
+		-- (hideAllEspDrawings("esp_disabled")). Гашение было недостижимо, и при
+		-- выключении ESP всё нарисованное застывало на экране. Теперь
+		-- off-переход гасит Drawing ровно один раз (espWasOn).
+		if not CONFIG.ESP then
+			if espWasOn then
+				espWasOn = false
+				Bridge.hideAllEspDrawings("esp_disabled")
 			end
-			local updateT = Bridge.perfBegin and Bridge.perfBegin() or nil
-			Bridge.updateESP(dt)
-			if Bridge.perfEnd then Bridge.perfEnd("esp.update", updateT) end
-			if Bridge.updatePerfHud then Bridge.updatePerfHud(dt) end
-			if t - tGc >= 5 then
-				tGc = t
-				Bridge.cleanupEspCache()
-			end
-			-- FIX (ESP «зависал» на пару секунд): раньше здесь по таймеру
-			-- вызывался clearESP() — он сносил ВСЕ Drawing-объекты сразу.
-			-- Экран на кадр пустел, а потом заново создавались десятки
-			-- Drawing в одном кадре → видимый ступор, и всё это ради сборки
-			-- мусора, которую и так делает cleanupEspCache каждые 5 сек.
-			-- Теперь полный рескан только инвалидирует КЭШИ, не трогая
-			-- отрисовку: мёртвые записи уберёт cleanupEspCache, живые
-			-- просто перерисуются на следующем кадре — без моргания.
-			if t - tFull >= (CONFIG.EspFullRescanInterval or 60) then
-				tFull = t
-				-- FIX (ESP «застывает на пару секунд»): раньше здесь стояло
-				-- State.espRanked = nil. Дальше в updateESP есть ранний выход
-				-- «ranked пустой → пропускаем кадр», и он срабатывал ДО всей
-				-- отрисовки. Пересборка ranked идёт в task.defer и может занять
-				-- несколько кадров — всё это время ESP не обновлялся вообще, а
-				-- Drawing-объекты оставались с прошлыми координатами. Выглядело
-				-- ровно как «замерло перед сканом».
-				-- Теперь ranked НЕ трогаем: сбрасываем только счётчик, чтобы
-				-- пересборка стартовала, а рисуем по старому списку до её
-				-- окончания. Мёртвые строки отфильтровываются в самом цикле.
-				State.espLastActorCount = -1
-				Bridge.invalidateReplicatorCache()
-				Bridge.cleanupEspCache()
-			end
-			-- Состав команд: держим синхронно с library (там же дефолт 3с),
-			-- чтобы после нового матча союзники не висели красными.
-			if t - tSquad >= (CONFIG.SquadRefreshInterval or 3) then
-				tSquad = t
-				if type(Bridge.refreshActorSquads) == "function" then
-						pcall(Bridge.refreshActorSquads)
-					end
-				end
-			end))
-		end,
-		stop = function()
-		if espConn then espConn:Disconnect(); espConn = nil end
-		-- FIX: clearESP сносит все Drawing СИНХРОННО — на 3-4к объектов это
-		-- заметный фриз при выключении. clearAllEspDrawings сразу подменяет
-		-- таблицу (кадр уже чистый), а уничтожает в task.defer.
-		Bridge.clearAllEspDrawings()
-	end,
-	toggle = function()
-		if espConn then
-			espConn:Disconnect(); espConn = nil; Bridge.clearAllEspDrawings()
-		else _M.start() end
-	end,
-	isRunning = function() return espConn ~= nil end,
-}
+			return
+		end
+		espWasOn = true
+		local updateT = Bridge.perfBegin and Bridge.perfBegin() or nil
+		Bridge.updateESP(dt)
+		if Bridge.perfEnd then Bridge.perfEnd("esp.update", updateT) end
+		if Bridge.updatePerfHud then Bridge.updatePerfHud(dt) end
+		if t - tGc >= 5 then
+			tGc = t
+			Bridge.cleanupEspCache()
+		end
+	end))
+	-- FIX v13: поднимаем диагностический поллер Debug-таба заново (он умирает
+	-- вместе с модулем в stop(), см. buildUI).
+	_M._uiAlive = true
+	if diagRespawn then diagRespawn() end
+end
+
+_M.stop = function()
+	if espConn then espConn:Disconnect(); espConn = nil end
+	espWasOn = false
+	-- FIX v13: диагностический поллер умирает вместе с модулем.
+	_M._uiAlive = false
+	-- FIX: clearESP сносит все Drawing СИНХРОННО — на 3-4к объектов это
+	-- заметный фриз при выключении. clearAllEspDrawings сразу подменяет
+	-- таблицу (кадр уже чистый), а уничтожает в task.defer.
+	Bridge.clearAllEspDrawings()
+end
+
+_M.toggle = function()
+	-- FIX v13: toggle раньше не трогал CONFIG.ESP — хоткей глушил Heartbeat,
+	-- а флаг и UI-тоггл оставались "on" (и наоборот). Теперь флаг, лайфцикл
+	-- и UI всегда согласованы.
+	if espConn then
+		CONFIG.ESP = false
+		_M.stop()
+	else
+		CONFIG.ESP = true
+		_M.start()
+	end
+	if uiKit and espFeature then
+		uiKit.syncToggle(espFeature.flag, CONFIG.ESP)
+	end
+end
+
+_M.isRunning = function() return espConn ~= nil end
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- UI-интеграция (MacLib). ESP живёт в табе Visuals (это визуал, не логика).
 -- Колбэки пишут в CONFIG (= Lib.CONFIG), который модуль читает в рантайме.
 -- ─────────────────────────────────────────────────────────────────────────
 function _M.buildUI(ui)
-	local flag = ui.flag or function(s) return "ESP_" .. s end
+	-- v13: мёртвый `local flag = ui.flag or ...` удалён — не использовался,
+	-- а его фолбэк-префикс "ESP_" расходился с настоящим флагообразованием кита.
 	local tab = ui.tabs and ui.tabs.Visuals
 	if not tab then return end
 
 	local K = Bridge.makeUiKit(ui)
+	uiKit = K   -- v13: для syncToggle из _M.toggle()
 
 	-- ═══ LEFT: сама фича и что она рисует ══════════════════════════════
 	local L = tab:Section({ Side = "Left" })
 
-	K.feature(L, {
+	-- FIX v13: сеттер теперь ведёт и лайфцикл модуля — иначе тоггл и
+	-- start()/stop() жили каждый своей жизнью (выключенный тоггл при живом
+	-- Heartbeat и наоборот).
+	espFeature = K.feature(L, {
 		Title = "ESP", Flag = "ESP",
 		get = function() return CONFIG.ESP end,
-		set = function(v) CONFIG.ESP = v end,
+		set = function(v) CONFIG.ESP = v; if v then _M.start() else _M.stop() end end,
 		Desc = "boxes n info over players n npcs\nbind works on PC + mobile",
 	})
 
@@ -2404,6 +2614,12 @@ function _M.buildUI(ui)
 	end
 
 	K.group(L, "Text")
+	-- FIX v13: имена наконец можно выключить (тоггла не существовало вовсе).
+	K.toggle(L, { Name = "Names", Flag = "ShowName", Title = "Names",
+		get = function() return CONFIG.EspShowName ~= false end,
+		set = function(v) CONFIG.EspShowName = v end })
+	-- v13: флаг "Distance" принадлежит ESP (killaura переехал на "KADistance" —
+	-- одинаковые строки коллидировали в MacLib.Options).
 	K.toggle(L, { Name = "Distance", Flag = "Distance", Title = "Distance",
 		get = function() return CONFIG.EspShowDistance end,
 		set = function(v) CONFIG.EspShowDistance = v end })
@@ -2525,17 +2741,29 @@ function _M.buildUI(ui)
 
 		K.group(D, "Diagnostics")
 		local stat = D:Label({ Text = "Tracked actors: -" })
-		task.spawn(function()
-			while stat and stat._frame and stat._frame.Parent do
-				local n = 0
-				pcall(function() if type(State.espRanked) == "table" then n = #State.espRanked end end)
-				local drawn = 0
-				pcall(function() for _ in pairs(State.drawings or {}) do drawn += 1 end end)
-				pcall(function() stat:UpdateName(("Ranked: %d | Drawings: %d | Running: %s")
-					:format(n, drawn, tostring(espConn ~= nil))) end)
-				task.wait(0.5)
-			end
-		end)
+		-- FIX v13: поллер жил вечно (условием был только Parent фрейма) — после
+		-- _M.stop() продолжал итерировать State.drawings каждые 0.5с до конца
+		-- сессии. Теперь умирает вместе с модулем (_M._uiAlive, гасится в
+		-- stop()), а start() поднимает его заново через diagRespawn.
+		local diagRunning = false
+		diagRespawn = function()
+			if diagRunning then return end
+			diagRunning = true
+			task.spawn(function()
+				while stat and stat._frame and stat._frame.Parent and _M._uiAlive do
+					local n = 0
+					pcall(function() if type(State.espRanked) == "table" then n = #State.espRanked end end)
+					local drawn = 0
+					pcall(function() for _ in pairs(State.drawings or {}) do drawn += 1 end end)
+					pcall(function() stat:UpdateName(("Ranked: %d | Drawings: %d | Running: %s")
+						:format(n, drawn, tostring(espConn ~= nil))) end)
+					task.wait(0.5)
+				end
+				diagRunning = false
+			end)
+		end
+		if _M._uiAlive == nil then _M._uiAlive = true end   -- UI построен до start()
+		diagRespawn()
 	end
 
 	K.ready()
