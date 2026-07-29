@@ -300,8 +300,38 @@ return function(Lib)
         if fresh then return fresh end
         return (_ctrl and isCtrl(_ctrl)) and _ctrl or nil
     end
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- FIX v4 [BUG#2] Сброс «брошенной» пары контроллер/актор — ОБЩИЙ для всех.
+    --
+    -- Игра подменяет контроллер/актор БЕЗ Alive=false (транспорт, редеплой и
+    -- пр.). Такая пара проходит оба гейта findCtrl навсегда: isCtrl проходит
+    -- (backref на месте), ctrlAlive проходит (Alive не переворачивали) — и
+    -- rescanCtrl больше НИКОГДА не выполняется до конца сессии.
+    --
+    -- Сброс для этого случая в v3 уже был написан, но лежал внутри
+    -- getSelfCharacter — а тот зовётся только из thirdPersonStep, который
+    -- выходит сразу при выключенном V.ThirdPersonEnabled (это дефолт!). То
+    -- есть у большинства пользователей фикс не работал: FreeGun писал
+    -- SeatCanEquip призраку (экипировка в транспорте оставалась заблокирована),
+    -- LockpickBypass читал CurrentState призрака и никогда не срабатывал, а
+    -- findVehicleController деградировал до GC-сканов. Ничего не самолечилось —
+    -- только включение Self Skin «магически» всё чинило. Теперь проверка живёт
+    -- в getLA, то есть работает для ВСЕХ потребителей.
+    -- ═══════════════════════════════════════════════════════════════════════
     local function getLA()
-        local c = findCtrl(); return c and rawget(c, "_localActor") or nil
+        local c = findCtrl()
+        local la = c and rawget(c, "_localActor") or nil
+        if type(la) == "table" and rawget(la, "Alive") ~= false then
+            local ok, char = pcall(function() return la.Character end)
+            -- актор «жив», но модели нет → пара брошена, кэш пора выбросить.
+            -- В транспорте la.Character остаётся валидным, поэтому скин в
+            -- машине не слетает (см. коммент про isCtrl выше).
+            if not (ok and typeof(char) == "Instance"
+                    and char:IsA("Model") and char.Parent) then
+                _ctrl = nil
+            end
+        end
+        return la
     end
 
     -- (поиск транспорта переехал в findVehicleController — секция VEHICLE FLY/SPEED)
@@ -588,6 +618,33 @@ return function(Lib)
         end
         _vmRestyleT = nowT
         _vmStyleApplied = vm
+        -- FIX v4 [BUG#2]: если Flux переиспользует объект vm между респавнами
+        -- (пересоздавая только его Instance'ы), записи об уничтоженных частях
+        -- прошлых жизней копились в vmStyledParts НАВСЕГДА: очистка была только
+        -- при смене identity объекта vm или выключении фичи. tickGradientStore
+        -- обходил их каждый кадр (пропуская по part.Parent) — медленная утечка
+        -- памяти и per-frame итераций, растущая с числом смертей.
+        -- Отпарентченным частям возвращаем оригинал и выкидываем запись: если
+        -- игра часть переиспользует, styleOnePart перехватит её заново.
+        -- Восстановление один-в-один как в restoreStore (включая sa/tex).
+        for part, s in pairs(vmStyledParts) do
+            if part and not part.Parent then
+                pcall(function()
+                    part.Material     = s.M
+                    part.Color        = s.C
+                    part.Transparency = s.T
+                    if s.tex ~= nil then part.TextureID = s.tex end
+                end)
+                if s.sa then
+                    for _, rec in ipairs(s.sa) do
+                        pcall(function()
+                            if rec.inst and rec.parent then rec.inst.Parent = rec.parent end
+                        end)
+                    end
+                end
+                vmStyledParts[part] = nil
+            end
+        end
         local weapon = rawget(vm, "CurrentModel")   -- модель оружия — НЕ трогаем
 
         -- 1) явные корни рук + всё, что к ним приварено/вложено (перчатки, рукав, часы)
@@ -1108,7 +1165,29 @@ return function(Lib)
     end
     local _vehCtrl
     local function findVehicleController()
-        if isVehicleController(_vehCtrl) then return _vehCtrl end
+        -- FIX v4 [BUG#2]: кэш проверялся ПЕРВЫМ и перекрывал честный путь через
+        -- la.Controller. Единственная проверка на протухание — veh.Controlling,
+        -- а его игра опускает только при ШТАТНОМ выходе из машины. Если игрок
+        -- погиб от уничтожения машины, клиентская таблица просто выбрасывается
+        -- (наша ссылка держит её в GC) с Controlling == true — кэш оставался
+        -- «валидным» навсегда, и Fly/Speed до конца сессии работали по
+        -- обломкам, не подхватывая новую машину. Сверяем кэш с актуальным
+        -- контроллером актора и живостью VehicleMain.
+        if isVehicleController(_vehCtrl) then
+            local laChk = getLA()
+            local cur = type(laChk) == "table" and rawget(laChk, "Controller") or nil
+            if isVehicleController(cur) and not rawequal(cur, _vehCtrl) then
+                _vehCtrl = nil                       -- игрок уже в ДРУГОЙ машине
+            else
+                local veh   = rawget(_vehCtrl, "_vehicle")
+                local vmain = type(veh) == "table" and rawget(veh, "VehicleMain") or nil
+                if typeof(vmain) == "Instance" and vmain.Parent == nil then
+                    _vehCtrl = nil                   -- машина уничтожена (взрыв)
+                else
+                    return _vehCtrl
+                end
+            end
+        end
         _vehCtrl = nil
         -- 1) через LocalActor.Controller — без сканов
         local la = getLA()
@@ -1343,7 +1422,13 @@ return function(Lib)
         if not _canEquipHooked then installFreeGunHook() end
         -- лёгкий фолбэк для транспорта: разрешаем экипировку в сиденье
         local la = getLA()
-        if type(la) == "table" and rawget(la, "SeatCanEquip") ~= true then
+        -- FIX v4 [BUG#2]: на экране смерти findCtrl намеренно возвращает МЁРТВЫЙ
+        -- кэш («мы реально мертвы»), поэтому getLA отдавал труп. _fgSeatOrig
+        -- захватывался с трупа из прошлой жизни, и потом этот «оригинал»
+        -- restoreFreeGunSeat писал уже ЖИВОМУ актору — FreeGun после выключения
+        -- оставлял поле игры в неверном состоянии. Мёртвых не трогаем.
+        if type(la) == "table" and rawget(la, "Alive") ~= false
+        and rawget(la, "SeatCanEquip") ~= true then
             -- запоминаем исходное значение ОДИН раз, чтобы вернуть его в stop
             if _fgSeatOrig == nil then _fgSeatOrig = rawget(la, "SeatCanEquip") or false end
             pcall(function() la.SeatCanEquip = true end)
@@ -1482,6 +1567,15 @@ return function(Lib)
     local function lightingStep()
         local amb, fb, nofog = V.AmbientEnabled, V.FullbrightEnabled, V.NoFogEnabled
         if not (amb or fb or nofog) then return end
+        -- FIX v4 [BUG#2]: ПЕРВЫЙ снапшот Lighting нельзя снимать на экране
+        -- смерти — игра тонирует Lighting под своё death-состояние, снимок
+        -- one-shot, и потом lightingOff() навсегда «восстанавливал» мёртвый
+        -- вайб вместо освещения карты. Хоткеи и UI на экране смерти работают,
+        -- так что попасть сюда мёртвым — обычное дело.
+        if not lightSavedOK then
+            local laL = getLA()
+            if type(laL) == "table" and rawget(laL, "Alive") == false then return end
+        end
         saveLighting()
         if amb then
             pcall(function()
@@ -1515,12 +1609,38 @@ return function(Lib)
             end)
         end
         -- Fullbright — отдельная простая фича: просто «видно всё».
+        --
+        -- FIX v4 [BUG#4]: раньше Fullbright БЕЗУСЛОВНО писал серый
+        -- FULLBRIGHT_COL в Ambient/OutdoorAmbient — уже ПОСЛЕ ambient-ветки.
+        -- При обеих включённых фичах выбранные Shadow/Outdoor Tint молча
+        -- заменялись на серый 178,178,178: пользователь тыкал цвет в пикере, а
+        -- на экране видел серость. Это одна из причин «цвет Atmosphere не тот,
+        -- что указан в UI». Теперь при активной Atmosphere сохраняем ОТТЕНОК
+        -- пользователя, а от Fullbright берём только яркость: поднимаем цвет до
+        -- нужной светимости, не убивая тон.
         if fb then
             pcall(function()
-                Lighting.Brightness     = math.max(Lighting.Brightness, 2)
-                Lighting.Ambient        = FULLBRIGHT_COL
-                Lighting.OutdoorAmbient = FULLBRIGHT_COL
-                Lighting.GlobalShadows  = false
+                Lighting.Brightness    = math.max(Lighting.Brightness, 2)
+                Lighting.GlobalShadows = false
+                if amb then
+                    -- сохранить тон, поднять светимость до уровня fullbright
+                    local function lift(c)
+                        if typeof(c) ~= "Color3" then return FULLBRIGHT_COL end
+                        local peak = math.max(c.R, c.G, c.B)
+                        if peak < 0.02 then return FULLBRIGHT_COL end
+                        local target = FULLBRIGHT_COL.R      -- целевая светимость
+                        local k = math.max(1, target / peak)
+                        return Color3.new(
+                            math.min(c.R * k, 1),
+                            math.min(c.G * k, 1),
+                            math.min(c.B * k, 1))
+                    end
+                    Lighting.Ambient        = lift(V.AmbientColor)
+                    Lighting.OutdoorAmbient = lift(V.AmbientOutdoorColor)
+                else
+                    Lighting.Ambient        = FULLBRIGHT_COL
+                    Lighting.OutdoorAmbient = FULLBRIGHT_COL
+                end
             end)
         end
         if nofog then
@@ -1633,6 +1753,12 @@ return function(Lib)
     local function lockpickActive()
         local la = getLA()
         if type(la) ~= "table" then return false end
+        -- FIX v4 [BUG#2]: труп держит CurrentState.LockPick, если игрок умер
+        -- посреди мини-взлома. Гейт гонял filtergc каждые 0.4с ВЕСЬ экран
+        -- смерти (хитчи), а если игра не выставила _cancelled прерванной
+        -- мини-игре — уходил FireServer("ActivateInteract","Picked") от
+        -- мёртвого игрока, то есть серверу видимый интеракт с того света.
+        if rawget(la, "Alive") == false then return false end
         local cs = rawget(la, "CurrentState")
         return type(cs) == "table" and cs.LockPick and true or false
     end
@@ -2129,15 +2255,43 @@ return function(Lib)
                 end,
                 Desc = "ur own time of day n mood\noverrides whatever the map sets",
             })
-            -- Пресет ставит всю атмосферу разом. Ползунки ниже остаются
-            -- доступны — любая правка переводит пресет в Custom.
+            -- ═══════════════════════════════════════════════════════════════
+            -- FIX v4 [BUG#4 + BUG#5] Atmosphere: переделка контролов.
+            --
+            -- BUG#4 (цвета не совпадали с UI): manual() менял ТОЛЬКО
+            --   V.AmbientPreset, а сам элемент дропдауна оставался на прошлом
+            --   выборе ("Sunset"). MacLib сохраняет ЭЛЕМЕНТЫ, а не CONFIG —
+            --   значит SaveConfig писал пресет рядом с кастомными цветами, а на
+            --   LoadConfig MacLib дёргал колбэк дропдауна, тот звал
+            --   applyAmbientPreset и затирал все пять цветов + ambRefresh
+            --   пропихивал цвета пресета в сами пикеры. Кастом пользователя
+            --   исчезал и из конфига, и из UI. Теперь manual() синхронизирует
+            --   элемент, а колбэк дропдауна защищён от собственного эха.
+            --   Заодно снят форс V.AmbientEnabled=true при загрузке пресета —
+            --   он включал фичу даже если её сохранили выключенной.
+            --
+            -- BUG#5 (неудобная настройка): три слайдера жили в offset-кодировке
+            --   и показывали не то, что значат — Brightness ×10 (юзер видит
+            --   «20» = 2.0), Exposure +200 (видит «200» = 0), Sun Angle +90
+            --   (видит «135» = 45). Теперь у всех РЕАЛЬНЫЕ значения с
+            --   Precision/Prefix, порядок — от частого к редкому, добавлены
+            --   Reset и понятные подписи.
+            --   ВНИМАНИЕ: у трёх слайдеров сменилась шкала, поэтому сменены и
+            --   флаги (AmbBright→AmbBright2, AmbExposure→AmbExp2,
+            --   AmbLat→AmbSunAngle) — иначе старое сохранённое «20» приехало бы
+            --   как яркость 20 (ослепляющая). Эти три значения сбросятся один
+            --   раз, как было при Distance→KADistance в killaura v14.
+            -- ═══════════════════════════════════════════════════════════════
             local ambRefresh
-            K.dropdown(SA, { Name = "Preset", Flag = "AmbPreset",
+            local _ambSync = false
+            local elPreset
+
+            elPreset = K.dropdown(SA, { Name = "Preset", Flag = "AmbPreset",
                 Options = AMBIENT_PRESET_ORDER,
                 Default = V.AmbientPreset or "Custom",
                 Callback = function(v)
+                    if _ambSync then return end   -- эхо своего же UpdateSelection
                     if v ~= "Custom" and applyAmbientPreset(v) then
-                        V.AmbientEnabled = true
                         if ambRefresh then ambRefresh() end
                     else
                         V.AmbientPreset = "Custom"
@@ -2149,65 +2303,87 @@ return function(Lib)
             -- FIX v3: _ambSync — ambRefresh дёргает UpdateState/UpdateValue, а
             -- MacLib синхронно эхает колбэки; без гейта только что выбранный
             -- пресет тут же слетал бы в Custom.
-            local _ambSync = false
+            -- FIX v4: синкаем и сам элемент дропдауна (см. блок выше).
             local function manual()
-                if not _ambSync then V.AmbientPreset = "Custom" end
+                if _ambSync then return end
+                if V.AmbientPreset == "Custom" then return end
+                V.AmbientPreset = "Custom"
+                if elPreset then
+                    _ambSync = true
+                    pcall(function() elPreset:UpdateSelection("Custom") end)
+                    _ambSync = false
+                end
             end
 
-            local elTime = K.slider(SA, { Name = "Time", Flag = "ClockTime",
-                Default = V.AmbientClockTime, Min = 0, Max = 24, Suffix = "h",
+            -- ── Основное: то, что крутят чаще всего ──────────────────────
+            local elTime = K.slider(SA, { Name = "Time of Day", Flag = "ClockTime",
+                Default = V.AmbientClockTime or 12, Min = 0, Max = 24,
+                Precision = 1, Suffix = "h",
                 Callback = function(v) V.AmbientClockTime = v; manual() end,
-                Desc = "0 = midnight, 12 = noon, 18 = sunset" })
-            local elBright = K.slider(SA, { Name = "Brightness", Flag = "AmbBright",
-                Default = math.floor((V.AmbientBrightness or 2) * 10), Min = 0, Max = 100,
-                Callback = function(v) V.AmbientBrightness = v / 10; manual() end })
-            local elExp = K.slider(SA, { Name = "Exposure", Flag = "AmbExposure",
-                Default = math.floor((V.AmbientExposure or 0) * 100) + 200, Min = 0, Max = 400,
-                Callback = function(v) V.AmbientExposure = (v - 200) / 100; manual() end,
-                Desc = "200 = neutral, lower = darker, higher = blown out" })
-            local elLat = K.slider(SA, { Name = "Sun Angle", Flag = "AmbLat",
-                Default = math.floor(V.AmbientLatitude or 45) + 90, Min = 0, Max = 180,
-                Callback = function(v) V.AmbientLatitude = v - 90; manual() end,
-                Desc = "moves where the sun sits in the sky" })
+                Desc = "0 = midnight · 6 = dawn · 12 = noon · 18 = sunset" })
+            local elBright = K.slider(SA, { Name = "Brightness", Flag = "AmbBright2",
+                Default = V.AmbientBrightness or 2, Min = 0, Max = 6,
+                Precision = 1,
+                Callback = function(v) V.AmbientBrightness = v; manual() end,
+                Desc = "2 = game default · 4+ = washed out" })
+            local elExp = K.slider(SA, { Name = "Exposure", Flag = "AmbExp2",
+                Default = V.AmbientExposure or 0, Min = -2, Max = 2,
+                Precision = 2,
+                Callback = function(v) V.AmbientExposure = v; manual() end,
+                Desc = "0 = neutral · minus = darker · plus = blown out" })
 
+            -- ── Цвета ────────────────────────────────────────────────────
             K.group(SA, "Colors")
             local elAmb = K.color(SA, { Name = "Shadow Tint", Flag = "AmbColor",
                 Default = V.AmbientColor,
                 Callback = function(c) V.AmbientColor = c; manual() end,
-                Desc = "color of everything in shade" })
+                Desc = "color of everything in shade — the main mood dial" })
             local elOut = K.color(SA, { Name = "Outdoor Tint", Flag = "AmbOutColor",
                 Default = V.AmbientOutdoorColor,
-                Callback = function(c) V.AmbientOutdoorColor = c; manual() end })
+                Callback = function(c) V.AmbientOutdoorColor = c; manual() end,
+                Desc = "color of open-sky lighting" })
             local elTintT = K.color(SA, { Name = "Highlight Tint", Flag = "AmbTintTop",
                 Default = V.AmbientTintTop,
                 Callback = function(c) V.AmbientTintTop = c; manual() end,
-                Desc = "tints lit surfaces — keep it subtle" })
+                Desc = "tints lit surfaces — keep it subtle, black = off" })
             local elTintB = K.color(SA, { Name = "Shade Tint", Flag = "AmbTintBottom",
                 Default = V.AmbientTintBottom,
-                Callback = function(c) V.AmbientTintBottom = c; manual() end })
+                Callback = function(c) V.AmbientTintBottom = c; manual() end,
+                Desc = "tints unlit surfaces, black = off" })
+
+            -- ── Тонкая настройка ─────────────────────────────────────────
+            K.group(SA, "Sun & Shadows")
+            local elLat = K.slider(SA, { Name = "Sun Angle", Flag = "AmbSunAngle",
+                Default = V.AmbientLatitude or 45, Min = -90, Max = 90,
+                Precision = 0, Suffix = "°",
+                Callback = function(v) V.AmbientLatitude = v; manual() end,
+                Desc = "where the sun sits · 0 = overhead track" })
             -- FIX v3: manual() — раньше правка Shadows/Custom Fog не переводила
             -- пресет в Custom, в отличие от всех остальных контролов атмосферы.
             local elShadows = K.toggle(SA, { Name = "Shadows", Flag = "AmbShadows", Title = "Shadows",
                 get = function() return V.AmbientShadows ~= false end,
-                set = function(v) V.AmbientShadows = v; manual() end })
+                set = function(v) V.AmbientShadows = v; manual() end,
+                Desc = "off = flat lighting, slightly better fps" })
 
             K.group(SA, "Fog")
             local elFogOn = K.toggle(SA, { Name = "Custom Fog", Flag = "AmbFogOn", Title = "Custom Fog",
                 get = function() return V.AmbientFogEnabled end,
                 set = function(v) V.AmbientFogEnabled = v; manual() end,
-                Desc = "for haze n distance mood\nuse No Fog instead if u just want it gone" })
+                Desc = "haze n distance mood\nuse No Fog instead if u just want it gone" })
             local elFogCol = K.color(SA, { Name = "Fog Color", Flag = "AmbFogColor",
                 Default = V.AmbientFogColor,
                 Callback = function(c) V.AmbientFogColor = c; manual() end })
             local elFogStart = K.slider(SA, { Name = "Fog Start", Flag = "AmbFogStart",
                 Default = V.AmbientFogStart or 0, Min = 0, Max = 2000, Suffix = " st",
-                Callback = function(v) V.AmbientFogStart = v; manual() end })
+                Callback = function(v) V.AmbientFogStart = v; manual() end,
+                Desc = "distance where fog begins" })
             local elFogEnd = K.slider(SA, { Name = "Fog End", Flag = "AmbFogEnd",
                 Default = V.AmbientFogEnd or 800, Min = 50, Max = 5000, Suffix = " st",
-                Callback = function(v) V.AmbientFogEnd = v; manual() end })
+                Callback = function(v) V.AmbientFogEnd = v; manual() end,
+                Desc = "distance where fog is solid" })
 
             -- Пресет меняет V.*, но ползунки/пикеры об этом не знают —
-            -- синхронизируем их отображение, иначе они по��азывают старые числа.
+            -- синхронизируем их отображение, иначе они показывают старые числа.
             ambRefresh = function()
                 _ambSync = true   -- FIX v3: эхо UpdateState не должно звать manual()
                 local function setV(el, val)
@@ -2216,21 +2392,36 @@ return function(Lib)
                 local function setC(el, col)
                     if el and col then pcall(function() el:SetColor(col) end) end
                 end
-                setV(elTime,    V.AmbientClockTime)
-                setV(elBright,  math.floor((V.AmbientBrightness or 2) * 10))
-                setV(elExp,     math.floor((V.AmbientExposure or 0) * 100) + 200)
-                setV(elLat,     math.floor(V.AmbientLatitude or 45) + 90)
+                -- FIX v4: реальные значения, без ×10 / +200 / +90
+                setV(elTime,     V.AmbientClockTime or 12)
+                setV(elBright,   V.AmbientBrightness or 2)
+                setV(elExp,      V.AmbientExposure or 0)
+                setV(elLat,      V.AmbientLatitude or 45)
                 setV(elFogStart, V.AmbientFogStart or 0)
-                setV(elFogEnd,  V.AmbientFogEnd or 800)
-                setC(elAmb,     V.AmbientColor)
-                setC(elOut,     V.AmbientOutdoorColor)
-                setC(elTintT,   V.AmbientTintTop)
-                setC(elTintB,   V.AmbientTintBottom)
-                setC(elFogCol,  V.AmbientFogColor)
+                setV(elFogEnd,   V.AmbientFogEnd or 800)
+                setC(elAmb,      V.AmbientColor)
+                setC(elOut,      V.AmbientOutdoorColor)
+                setC(elTintT,    V.AmbientTintTop)
+                setC(elTintB,    V.AmbientTintBottom)
+                setC(elFogCol,   V.AmbientFogColor)
                 if elShadows then pcall(function() elShadows:UpdateState(V.AmbientShadows ~= false) end) end
                 if elFogOn   then pcall(function() elFogOn:UpdateState(V.AmbientFogEnabled == true) end) end
+                -- дропдаун тоже: applyAmbientPreset выставил V.AmbientPreset
+                if elPreset and V.AmbientPreset then
+                    pcall(function() elPreset:UpdateSelection(V.AmbientPreset) end)
+                end
                 _ambSync = false
             end
+
+            -- FIX v4 [BUG#5]: возврат к пресету. Раньше «уехавшую» атмосферу
+            -- нельзя было откатить иначе как переключением пресета туда-обратно
+            -- (а из Custom и этого не сделать — Custom не применяет ничего).
+            K.button(SA, { Name = "Reset Atmosphere", Title = "Atmosphere",
+                Callback = function()
+                    applyAmbientPreset("Clear")
+                    ambRefresh()
+                    return "reset to Clear"
+                end })
 
             local SIN = tabMisc:Section({ Side = "Right" })
             SIN:Header({ Name = "Interactions" })
@@ -2267,6 +2458,18 @@ return function(Lib)
 
         K.ready()
     end
+
+    -- FIX v4 [C1]: guard от повторной инжекции — прошлый инстанс держал свои
+    -- Heartbeat/FOV-коннекты/хуки Viewmodel и перекрашивал мир параллельно.
+    do
+        local g = (type(getgenv) == "function" and getgenv()) or _G
+        local prev = g.BRM5_VIS_MODULE
+        if type(prev) == "table" and type(prev.stop) == "function" and prev ~= M then
+            pcall(prev.stop)
+        end
+        g.BRM5_VIS_MODULE = M
+    end
+    if Bridge.registerModule then Bridge.registerModule("visuals", M) end
 
     return M
 end
