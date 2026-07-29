@@ -294,6 +294,9 @@ local function clearMeleeBoot()
     -- v14: раньше kaMeleeRep НЕ чистился — последняя handler-таблица жила
     -- после анэквипа/смерти до конца сессии.
     State.kaMeleeRep       = nil
+    -- v17: RaycastParams мили-репликатора — тоже отпускаем, иначе держим ссылку
+    -- на объект прошлого оружия/жизни (и теряем строгость опознания удара).
+    State.kaMeleeRayParams = nil
     State.kaGcScanEq       = nil
     State.kaUseThreadActive = false
     State.kaUseThreadSince  = 0
@@ -723,6 +726,30 @@ local function resolveMeleeContext(force)
     State.kaCtxEq  = eqStr
     State.kaCtxTime = now()
     State.kaMeleeRep = rep
+    -- ═══════════════════════════════════════════════════════════════════
+    -- v17 [КРИТИЧНО: хук ломал ШАГИ игры и морозил CFrame актора]
+    --
+    -- Публикуем RaycastParams САМОГО мили-репликатора. По дампу
+    -- MeleeInventoryReplicator (строки 30 и 128) удар кастуется ровно так:
+    --     _params = v13                                   -- свой объект
+    --     workspace:Raycast(v26, p25, p24._params)
+    --     or workspace:Spherecast(v26, 1, p25, p24._params)
+    -- Значит мили-рейкаст однозначно опознаётся по идентичности _params.
+    --
+    -- Зачем: перехват в namecall срабатывал на ЛЮБОЙ workspace:Raycast, пока
+    -- идёт замах. В том числе на ActorClass._getMaterial (строка 465) — это
+    -- рейкаст ВНИЗ (0,-3.5,0) для материала под ногами. Он получал подделанный
+    -- хит с частью тела врага, дальше _doFootstep падал, а он вызывается из
+    -- ActorClass.Update ДО записи p294.CFrame = v418 (строка 3005). Итог:
+    -- CFrame актора перестаёт обновляться прямо во время удара — игрока
+    -- «косоебит туда-сюда». Ошибка из скриншота ровно про этот стек.
+    -- ═══════════════════════════════════════════════════════════════════
+    if type(rep) == "table" then
+        local prm = rawget(rep, "_params")
+        if typeof(prm) == "RaycastParams" then
+            State.kaMeleeRayParams = prm
+        end
+    end
     return ctx
 end
 
