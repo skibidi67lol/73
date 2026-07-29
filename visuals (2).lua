@@ -1483,6 +1483,181 @@ return function(Lib)
     -- Константа: раньше два Color3 создавались каждый кадр при Fullbright
     local FULLBRIGHT_COL = Color3.fromRGB(178, 178, 178)
 
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- FIX v5 [МЕЛЬКАНИЕ ATMOSPHERE] Игра перезаписывает освещение каждый кадр.
+    --
+    -- ПРИЧИНА (из дампа Flux/Services/EnvironmentService.Update):
+    --   строка 605:  Lighting.ClockTime          = ClockTime
+    --   строка 702:  Lighting.GeographicLatitude = v81.GeographicLatitude or ...
+    --   строка 829:  if not v81.NoColors then
+    --                    Lighting.ColorShift_Top = ...
+    --                    Lighting.OutdoorAmbient = ...
+    --                end
+    -- Update зовётся из per-frame Stepped клиента, то есть игра пишет эти
+    -- четыре свойства 60 раз в секунду. Наш полный проход по Lighting был
+    -- затроттлен до ~4 Гц (perf-фикс v3), поэтому из каждых ~15 кадров наши
+    -- значения держались только в одном — отсюда мельканиe между нашей
+    -- атмосферой и игровой.
+    --
+    -- РЕШЕНИЕ — ровно тот же приём, что уже применён здесь для FOV: не гонять
+    -- запись каждый кадр (это и есть фриз), а ПЕРЕБИВАТЬ саму запись игры через
+    -- GetPropertyChangedSignal. Событийно: ноль стоимости, когда игра молчит, и
+    -- коррекция в том же кадре, когда пишет → окно мелькания нулевое.
+    --
+    -- ClockTime вдобавок решается совсем без борьбы: игра берёт его из
+    -- Lighting:GetAttribute("ClockTime") (строка 588 дампа). Пишем АТРИБУТ — и
+    -- игра сама, своей же рукой, ставит наше время суток каждый кадр.
+    --
+    -- Незатронутые свойства (Ambient, Brightness, ColorShift_Bottom, Fog*,
+    -- Exposure, GlobalShadows, EnvironmentDiffuse/Specular) игра НЕ пишет —
+    -- они остаются на дешёвом 4 Гц проходе, перф не теряем.
+    -- ═══════════════════════════════════════════════════════════════════════
+    local _lightConns   = {}      -- [prop] = RBXScriptConnection
+    local _lightWriting = false   -- анти-рекурсия: наша запись тоже дёргает сигнал
+    local _ctAttrConn   = nil
+    local _ctAttrOrig   = nil
+    local _ctAttrSet    = false
+
+    -- Fullbright сохраняет ОТТЕНОК пользователя, берёт только светимость
+    -- (FIX v4 [BUG#4]). Единый источник истины: формулу зовут и lightingStep,
+    -- и re-assert по сигналу — иначе OutdoorAmbient дёргался бы между двумя
+    -- независимо посчитанными «правильными» цветами.
+    local function liftToFullbright(c)
+        if typeof(c) ~= "Color3" then return FULLBRIGHT_COL end
+        local peak = math.max(c.R, c.G, c.B)
+        if peak < 0.02 then return FULLBRIGHT_COL end
+        local k = math.max(1, FULLBRIGHT_COL.R / peak)   -- целевая светимость
+        return Color3.new(
+            math.min(c.R * k, 1),
+            math.min(c.G * k, 1),
+            math.min(c.B * k, 1))
+    end
+
+    -- Цель для контестируемого свойства; nil = сейчас не наше, не трогаем.
+    local function contestedTarget(prop)
+        if not V.AmbientEnabled then return nil end
+        if prop == "GeographicLatitude" then
+            return V.AmbientLatitude or 45
+        elseif prop == "ColorShift_Top" then
+            return V.AmbientTintTop
+        elseif prop == "OutdoorAmbient" then
+            if V.FullbrightEnabled then
+                return liftToFullbright(V.AmbientOutdoorColor)
+            end
+            return V.AmbientOutdoorColor
+        end
+        return nil
+    end
+
+    local CONTESTED = { "GeographicLatitude", "ColorShift_Top", "OutdoorAmbient" }
+
+    local function reassertLightProp(prop)
+        if _lightWriting then return end
+        local want = contestedTarget(prop)
+        if want == nil then return end
+        local cur = Lighting[prop]
+        if cur == want then return end   -- уже наше — не пишем (иначе эхо-цикл)
+        _lightWriting = true
+        pcall(function() Lighting[prop] = want end)
+        _lightWriting = false
+    end
+
+    local function hookLightingSignals()
+        for _, prop in ipairs(CONTESTED) do
+            if not _lightConns[prop] then
+                local ok, conn = pcall(function()
+                    return Lighting:GetPropertyChangedSignal(prop):Connect(
+                        LPH_NO_VIRTUALIZE(function() reassertLightProp(prop) end))
+                end)
+                if ok then _lightConns[prop] = conn end
+            end
+        end
+        -- ClockTime: пишем атрибут, который игра читает сама. Плюс страховка —
+        -- если сервер пушнёт своё значение, вернём наше (событийно, не в кадре).
+        if not _ctAttrConn then
+            local ok, conn = pcall(function()
+                return Lighting:GetAttributeChangedSignal("ClockTime"):Connect(
+                    LPH_NO_VIRTUALIZE(function()
+                        if _lightWriting or not V.AmbientEnabled then return end
+                        local want = V.AmbientClockTime
+                        if type(want) ~= "number" then return end
+                        if Lighting:GetAttribute("ClockTime") == want then return end
+                        _lightWriting = true
+                        pcall(function() Lighting:SetAttribute("ClockTime", want) end)
+                        _lightWriting = false
+                    end))
+            end)
+            if ok then _ctAttrConn = conn end
+        end
+    end
+
+    local function unhookLightingSignals()
+        for prop, conn in pairs(_lightConns) do
+            pcall(function() conn:Disconnect() end)
+            _lightConns[prop] = nil
+        end
+        if _ctAttrConn then pcall(function() _ctAttrConn:Disconnect() end); _ctAttrConn = nil end
+        -- возвращаем атрибут времени суток игре
+        if _ctAttrSet then
+            _lightWriting = true
+            pcall(function() Lighting:SetAttribute("ClockTime", _ctAttrOrig) end)
+            _lightWriting = false
+            _ctAttrSet, _ctAttrOrig = false, nil
+        end
+    end
+
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- FIX v5 [МЕЛЬКАНИЕ ТУМАНА] Игровой Atmosphere-инстанс.
+    --
+    -- Кроме свойств Lighting, EnvironmentService держит СВОЙ объект Atmosphere
+    -- (p78._atmosphere) и анимирует его каждый кадр (дамп, строки 746-752):
+    --   _atmosphere.Density = ...   _atmosphere.Color = ...:Lerp(...)
+    --   _atmosphere.Decay   = ...   _atmosphere.Glare / .Haze = Lerp(...)
+    -- Atmosphere в Roblox рендерится ПОВЕРХ Lighting.Fog* — поэтому наш
+    -- Custom Fog визуально боролся с игровой дымкой, которая ещё и плавно
+    -- лерпится каждый кадр. Обнулять её свойства бессмысленно: игра перепишет
+    -- их в том же кадре (та же причина, что и с ColorShift_Top).
+    --
+    -- Решение — ровно то, что делает сама игра в SetOverride при NoColors
+    -- (дамп, строки 556-563): `p70._atmosphere.Parent = nil`. Отпарентченный
+    -- Atmosphere не рендерится, а игровые записи в него становятся безвредными
+    -- — мелькать больше нечему. Состояние поддерживаемое: это её же ветка кода.
+    -- ═══════════════════════════════════════════════════════════════════════
+    local _gameAtmo, _gameAtmoParent = nil, nil
+    local function parkGameAtmosphere()
+        if _gameAtmo then return end
+        local ok, atmo = pcall(function()
+            return Lighting:FindFirstChildOfClass("Atmosphere")
+        end)
+        if not ok or not atmo then return end
+        _gameAtmo, _gameAtmoParent = atmo, atmo.Parent
+        pcall(function() atmo.Parent = nil end)
+    end
+    local function restoreGameAtmosphere()
+        if not _gameAtmo then return end
+        pcall(function() _gameAtmo.Parent = _gameAtmoParent end)
+        _gameAtmo, _gameAtmoParent = nil, nil
+    end
+
+    -- Ставит наше время суток через атрибут (игра сама применит его в Update).
+    local function applyClockTimeViaAttribute()
+        local want = V.AmbientClockTime
+        if type(want) ~= "number" then return false end
+        local okRead, cur = pcall(function() return Lighting:GetAttribute("ClockTime") end)
+        if not okRead then return false end
+        if cur == nil then return false end          -- атрибута нет — работаем по свойству
+        if not _ctAttrSet then
+            _ctAttrOrig = cur
+            _ctAttrSet = true
+        end
+        if cur ~= want then
+            _lightWriting = true
+            pcall(function() Lighting:SetAttribute("ClockTime", want) end)
+            _lightWriting = false
+        end
+        return true
+    end
+
     -- ── Готовые атмосферы ──────────────────────────────────────────────
     -- Крутить 12 ползунков вручную, чтобы получить нормальный вайб, —
     -- неудобно. Пресет ставит всё разом, дальше можно доводить руками
@@ -1577,12 +1752,23 @@ return function(Lib)
             if type(laL) == "table" and rawget(laL, "Alive") == false then return end
         end
         saveLighting()
+        -- FIX v5 [МЕЛЬКАНИЕ]: сигналы на контестируемые свойства ставим ровно
+        -- один раз, как только атмосфера включена (idempotent).
         if amb then
-            pcall(function()
-                if Lighting.ClockTime ~= V.AmbientClockTime then
-                    Lighting.ClockTime = V.AmbientClockTime
-                end
-            end)
+            hookLightingSignals()
+        end
+        if amb then
+            -- ClockTime: сначала пробуем атрибут — игра читает его в Update и
+            -- сама поставит наше время (см. EnvironmentService строка 588).
+            -- Борьбы нет вообще. Если атрибута нет — падаем на прямую запись,
+            -- как раньше (она нужна каждый кадр, игру никто не перебьёт иначе).
+            if not applyClockTimeViaAttribute() then
+                pcall(function()
+                    if Lighting.ClockTime ~= V.AmbientClockTime then
+                        Lighting.ClockTime = V.AmbientClockTime
+                    end
+                end)
+            end
         end
         local tL = now()
         if tL - _lightT < 0.25 then return end
@@ -1618,25 +1804,18 @@ return function(Lib)
         -- что указан в UI». Теперь при активной Atmosphere сохраняем ОТТЕНОК
         -- пользователя, а от Fullbright берём только яркость: поднимаем цвет до
         -- нужной светимости, не убивая тон.
+        -- FIX v5: сам lift вынесен в liftToFullbright (объявлен выше) — его же
+        -- использует contestedTarget("OutdoorAmbient") в re-assert по сигналу.
+        -- Раньше формула жила локально внутри этого pcall, и re-assert считал бы
+        -- своё значение независимо → OutdoorAmbient дёргался бы между двумя
+        -- разными «правильными» цветами.
         if fb then
             pcall(function()
                 Lighting.Brightness    = math.max(Lighting.Brightness, 2)
                 Lighting.GlobalShadows = false
                 if amb then
-                    -- сохранить тон, поднять светимость до уровня fullbright
-                    local function lift(c)
-                        if typeof(c) ~= "Color3" then return FULLBRIGHT_COL end
-                        local peak = math.max(c.R, c.G, c.B)
-                        if peak < 0.02 then return FULLBRIGHT_COL end
-                        local target = FULLBRIGHT_COL.R      -- целевая светимость
-                        local k = math.max(1, target / peak)
-                        return Color3.new(
-                            math.min(c.R * k, 1),
-                            math.min(c.G * k, 1),
-                            math.min(c.B * k, 1))
-                    end
-                    Lighting.Ambient        = lift(V.AmbientColor)
-                    Lighting.OutdoorAmbient = lift(V.AmbientOutdoorColor)
+                    Lighting.Ambient        = liftToFullbright(V.AmbientColor)
+                    Lighting.OutdoorAmbient = liftToFullbright(V.AmbientOutdoorColor)
                 else
                     Lighting.Ambient        = FULLBRIGHT_COL
                     Lighting.OutdoorAmbient = FULLBRIGHT_COL
@@ -1649,6 +1828,16 @@ return function(Lib)
                 Lighting.FogStart = 1e9
             end)
         end
+        -- FIX v5: решение по игровой дымке — СНАРУЖИ ветки amb.
+        -- Держать его внутри `if amb` было ошибкой: при включённом No Fog и
+        -- выключенной Atmosphere парковка не выполнялась вообще, и «No Fog» не
+        -- убирал туман до конца — игровой Atmosphere рендерится поверх Fog* и
+        -- давал остаточную дымку (плюс лерпился каждый кадр).
+        if (amb and V.AmbientFogEnabled) or nofog then
+            parkGameAtmosphere()
+        else
+            restoreGameAtmosphere()
+        end
     end
 
     -- FIX v3: общий off-путь Ambient/Fullbright/NoFog. Раньше его имели ТОЛЬКО
@@ -1656,6 +1845,10 @@ return function(Lib)
     -- мир оставался перекрашенным насовсем. Ещё включённые соседи пере-применят
     -- своё следующим heartbeat (_lightT сброшен → без 250мс мигания).
     local function lightingOff()
+        -- FIX v5 [МЕЛЬКАНИЕ]: сначала снимаем сигналы, иначе наш же
+        -- re-assert перебил бы restoreLighting и мир остался бы перекрашенным.
+        unhookLightingSignals()
+        restoreGameAtmosphere()   -- возвращаем игровую дымку на место
         restoreLighting()
         lightSavedOK = false
         _lightT = -999
