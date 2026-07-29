@@ -934,6 +934,28 @@ local function getKaReach()
     return cap
 end
 
+-- v15 [BUG «отталкивает»]: ОТДЕЛЬНЫЙ, жёсткий reach для ПАКЕТНОГО пути.
+--
+-- getKaReach() выше даёт запас ×1.6 — он для клиентского рейкаста (LegitAuto),
+-- где перебор не виден серверу. Но в PacketAuto Vector3 уходит на сервер
+-- НАПРЯМУЮ, и сервер валидирует его как хит луча длиной weapon.Reach из груди
+-- атакующего. Реальные значения Reach в дампе игры: 5 (20 оружий), 6 (4), 7 (2).
+-- Поэтому здесь запас минимальный — только на латентность/предикт, +1 stud.
+-- Фолбэк 5, а не 8: это модальное значение по дампу (20 из 26 оружий).
+local KA_PACKET_REACH_MARGIN = 1.0
+local function packetImpactReach()
+    local svc = State.kaMeleeSvc
+    local base
+    -- честный оригинал ДО MeleeReachBoost (boost клиентский, сервер о нём не знает)
+    if svc and State.kaDistOrig and type(State.kaDistOrig[svc]) == "number" then
+        base = State.kaDistOrig[svc]
+    elseif svc then
+        base = rawget(svc, "_distance")
+    end
+    if type(base) ~= "number" or base <= 0 then base = 5 end
+    return base + KA_PACKET_REACH_MARGIN
+end
+
 local function getKaTimings()
     local cd = CONFIG.KillAuraSwingCd or 0.35
     return getKaReach(), cd
@@ -1296,6 +1318,25 @@ local function triggerGameMeleeUse(svc, actor, ctx, aimPart, targetData)
                 warn("[KA] synthetic impact: нет hitPos или uid — part:", tostring(part), "uid:", tostring(uid))
                 return
             end
+            -- v15 [ТОТ ЖЕ БАГ, ЧТО В PacketAuto — и он ШИРЕ]:
+            -- сюда попадает не только PacketAuto (isPA), но и ЛЮБОЙ режим при
+            -- CONFIG.KillAuraNoWallCheck, а он по умолчанию TRUE. То есть
+            -- LegitAuto из коробки тоже слал абсолютную позицию врага вместо
+            -- хита луча длиной weapon.Reach — отсюда «отталкивает и в других
+            -- режимах». Безопасен только LegitAuto+WallCheck (ветка else ниже):
+            -- там hitPos возвращает сама игра из своего рейкаста.
+            -- Клампим на сферу reach вокруг груди — как MeleeInventoryReplicator.
+            do
+                local origin = kaImpactOrigin(actor)
+                if typeof(origin) == "Vector3" then
+                    local pReach = packetImpactReach()
+                    local to     = hitPos - origin
+                    local along  = to.Magnitude
+                    if along > pReach and along > 0.01 then
+                        hitPos = origin + to.Unit * pReach
+                    end
+                end
+            end
         else
             if at and actFn then
                 State.kaImpactSteer = true
@@ -1541,6 +1582,47 @@ local function triggerPacketAutoFire(actor, aimPart, targetData)
         warn("[KA] PacketAuto: hitPos не разрешён. aimPart=", tostring(aimPart))
         return false, "no_hitpos"
     end
+    -- ═══════════════════════════════════════════════════════════════════
+    -- v15 [ГЛАВНАЯ ПРИЧИНА «отталкивает при подходе к врагу»]
+    --
+    -- Разбор дампа игры (MeleeInventoryReplicator.Impact, строки 125-143):
+    --   local v26 = p24._actor.CFrame:PointToWorldSpace(Vector3.new(0, 2.5, 0))
+    --   local v27 = workspace:Raycast(v26, p25, p24._params)
+    --             or workspace:Spherecast(v26, 1, p25, p24._params)
+    --   return v27.Position, v28, v27.Instance.Name
+    -- То есть Vector3, который уходит на сервер, — это позиция хита ЛУЧА длиной
+    -- weapon.Reach из груди атакующего. По построению она НИКОГДА не дальше
+    -- Reach от игрока. Реальные Reach из дампа: 5 (20 оружий), 6 (4), 7 (2).
+    --
+    -- А PacketAuto слал ЧИСТЫЙ State.kaAimPoint — центр тела врага. Единственный
+    -- гейт перед выстрелом (performSwing) сравнивал с kaDist()+1, где kaDist() =
+    -- KillAuraDistance = 25, но это радиус ВЫБОРА цели, а не reach оружия. Итог:
+    -- Impact с |hitPos - грудь| до ~26 studs при реальном reach 5 — сервер видит
+    -- невозможный удар ~3 раза в секунду и откатывает позицию клиента
+    -- (CharacterController:Teleport пишет ForceNextPosition+SimulatedPosition —
+    -- мгновенный рывок; SetCFrame ставит _forceCFrame и Update лерпит к нему
+    -- dt*5 — плавное «тянет/отталкивает»). Ровно то, что чувствует игрок при
+    -- подходе к врагу: KillAura захватывает цель → начинается откат.
+    --
+    -- ПОЧЕМУ ПРЕДЫДУЩИЕ ФИКСЫ НЕ ПОМОГЛИ: getKaReach() здесь не вызывается
+    -- вообще, а interceptMeleeKaRaycast к этому пути не относится — PacketAuto
+    -- не делает рейкаст, он формирует вектор сам. Оба фикса лечили LegitAuto.
+    --
+    -- РЕШЕНИЕ: проецируем точку хита на сферу reach вокруг груди — получаем
+    -- ровно то, что вернул бы честный рейкаст игры. Направление на цель
+    -- сохраняется, force-hit продолжает работать.
+    -- ═══════════════════════════════════════════════════════════════════
+    do
+        local origin = kaImpactOrigin(actor)
+        if typeof(origin) == "Vector3" then
+            local reach = packetImpactReach()
+            local to    = hitPos - origin
+            local along = to.Magnitude
+            if along > reach and along > 0.01 then
+                hitPos = origin + to.Unit * reach
+            end
+        end
+    end
     if uid == nil then
         warn("[KA] PacketAuto: uid не разрешён. targetData=", tostring(targetData))
         return false, "no_uid"
@@ -1595,6 +1677,24 @@ local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
     -- [FIX] Вызываем ensureMeleeSvc чтобы заполнит�� kaUseEnv.net через
     -- upvalue-scan _use. Без этого kaUseEnv = nil и net не р��золвится.
     if kaMode == "PacketAuto" then
+        -- v15 [BUG «отталкивает»]: гейт по РЕАЛЬНОМУ reach, а не по kaDist().
+        --
+        -- Общий гейт выше сравнивает с kaDist()+1 = KillAuraDistance+1 = 26 —
+        -- но это радиус ВЫБОРА цели, а не досягаемость оружия. Для пакетного
+        -- пути это означало ~3 невозможных Impact в секунду на дистанции до 26
+        -- studs при реальном reach 5 → сервер откатывал позицию. Кламп точки
+        -- хита (см. triggerPacketAutoFire) делает пакет валидным геометрически,
+        -- но бить по врагу в 20 studs ножом всё равно бессмысленно: сервер
+        -- отклонит удар по несоответствию цели. Не шлём вообще — заодно снимаем
+        -- палевный паттерн «Slash+Impact 3/с в пустоту».
+        do
+            local origin = kaImpactOrigin(actor)
+            local tp = kaRefPos(targetData) or (aimPart and aimPart.Position) or aimPoint
+            if typeof(tp) == "Vector3" and typeof(origin) == "Vector3"
+                and (tp - origin).Magnitude > packetImpactReach() then
+                return false, "packet_out_of_reach"
+            end
+        end
         pcall(ensureMeleeSvc, actor, ctx)   -- заполняет State.kaUseEnv.net
         beginSwingState(aimPart, aimPoint, targetData)
         local ok, reason = triggerPacketAutoFire(actor, aimPart, targetData)
