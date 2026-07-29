@@ -596,6 +596,20 @@ return function(Lib)
         if type(a[10]) == "number" then faRealPitch = a[10] end
         if type(a[8])  == "number" and isValidHS(a[8]) then faRealState = a[8] end
         local realYaw = faRealYaw or (type(a[6]) == "number" and a[6]) or 0
+        -- ═══════════════════════════════════════════════════════════════════
+        -- FIX v20 [BUG#3]: во время мили-удара KillAura НЕ крутим тело.
+        --
+        -- Прицел (a[9]/a[10]) мы намеренно не трогаем по дефолту — сервер по
+        -- нему валидирует попадания из огнестрела (см. коммент выше). Но
+        -- мили-удар сервер проверяет по ПОЗИЦИИ и ФЕЙСИНГУ тела: KillAura
+        -- считает направление Impact от реального actor.CFrame и камеры, а
+        -- сервер в этот момент видит зажиттеренный yaw. Рассинхрон расширял
+        -- окно отклонения удара, и античит чаще откатывал позицию — вклад в
+        -- «меня отталкивает при ноже». Пока свинг активен, отдаём честный
+        -- поворот; на прицел и остальную логику это не влияет.
+        if State.kaImpactSteer or State.kaSwingBusy then
+            return
+        end
         local jit  = MOV.FakeAnglesJitter or 2.8
         local pAmp = MOV.FakeAnglesPitchAmp or 1.4
         local TAU  = math.pi * 2
@@ -1638,6 +1652,49 @@ return function(Lib)
         if faGhostHL then pcall(function() faGhostHL.Enabled = not hide end) end
     end
 
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- FIX v20 [BUG#4] Перекраска ЖИВОГО госта.
+    --
+    -- Колорпикер «Ghost Color» писал только в MOV.FakeAnglesGhostColor, а сам
+    -- цвет применялся ровно один раз — внутри buildFakeGhost. Клон
+    -- пересобирается лишь когда faGhostModel == nil/де-парентнут (респавн либо
+    -- Show Ghost off→on), поэтому выбранный цвет НЕ появлялся: гост до конца
+    -- жизни рендерился прежним (дефолтным 120,200,255). Пользователь видел
+    -- «цвет в UI не тот, что на экране». То же было со слайдером прозрачности
+    -- (применялся лишь на переходах hide/show) и с цветом окантовки, у которого
+    -- вообще не было контрола.
+    -- ═══════════════════════════════════════════════════════════════════════
+    local function restyleFakeGhost()
+        if not faGhostModel then return end
+        local col = MOV.FakeAnglesGhostColor or Color3.fromRGB(120, 200, 255)
+        local tr  = MOV.FakeAnglesGhostTransparency or 0.5
+        local mat = MOV.FakeAnglesGhostMaterial or Enum.Material.Glass
+        for _, d in ipairs(faGhostModel:GetDescendants()) do
+            if d:IsA("BasePart") then
+                pcall(function()
+                    d.Color    = col
+                    d.Material = mat
+                    -- скрытый гост держим на Transparency=1 (см. setGhostHidden)
+                    if not faGhostHidden then d.Transparency = tr end
+                end)
+            end
+        end
+        if faGhostHL then
+            pcall(function()
+                faGhostHL.FillColor        = col
+                faGhostHL.FillTransparency = math.clamp(tr + 0.35, 0, 1)
+                faGhostHL.OutlineColor     = MOV.FakeAnglesGhostOutline
+                                             or Color3.fromRGB(180, 235, 255)
+            end)
+        end
+    end
+    -- ВНИМАНИЕ: _M объявляется НИЖЕ (стр. ~2628), поэтому вешать сюда
+    -- `_M._restyleFakeGhost = ...` нельзя — на этой строке _M ещё не в области
+    -- видимости и имя резолвится в глобальный nil (тот же класс бага, что уже
+    -- ловили с gunHighlight и _M.toggle в esp). Публикуем через State, который
+    -- в области видимости с самого начала фабрики.
+    State.movRestyleFakeGhost = restyleFakeGhost
+
     -- Определение первого лица. Собственный сигнал игры — LocalActor.Zoom
     -- (CharacterCamera: Zoom > 0 = третье лицо). Дистанция до головы — fallback.
     local function isFirstPersonNow(la, char)
@@ -2586,7 +2643,9 @@ return function(Lib)
         -- FIX v2 (инертный модуль): State.running ставится только killaura /
         -- silentaim — загруженный первым (или единственным) movement молча не
         -- делал НИЧЕГО (оба тика гейтятся на State.running). Зеркалим killaura.
-        State.running = true
+        -- FIX v20 [H2]: через refcount (общий флаг иначе никто не опускает).
+        if Bridge.markModuleRunning then Bridge.markModuleRunning("movement", true)
+        else State.running = true end
 
         conns[1] = RunService.Heartbeat:Connect(newcclosure(function(dt)
             liveInputNow = isLiveInputActive()   -- FIX v2 perf: один вызов на кадр
@@ -2647,7 +2706,17 @@ return function(Lib)
 
     function _M.stop()
         started = false   -- FIX v2: разрешаем следующий start()
-        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+        -- FIX v20 [H2]: снимаем ссылку в общем refcount (см. markModuleRunning).
+        if Bridge.markModuleRunning then Bridge.markModuleRunning("movement", false) end
+        -- FIX v20 [C4]: было ipairs — массив conns РАЗРЕЖЕННЫЙ (индексы 3 и 4
+        -- освободились при рефакторинге физических хоткеев), поэтому ipairs
+        -- останавливался на дырке в [3], и conns[5]/conns[6]
+        -- (CharacterRemoving/CharacterAdded) НИКОГДА не отключались. Каждый
+        -- stop/start подтекал двумя коннектами, а на респавне
+        -- handleLocalDeath/attemptRecovery отрабатывали по разу на каждую
+        -- утёкшую пару — дублирующиеся сканы восстановления и pin старого
+        -- инстанса модуля.
+        for _, c in pairs(conns) do pcall(function() c:Disconnect() end) end
         conns = {}
         if ijConn then ijConn:Disconnect(); ijConn=nil end
         pcall(function() RunService:UnbindFromRenderStep(LEAN_BIND) end)   -- FIX v2
@@ -2951,13 +3020,29 @@ return function(Lib)
             get = function() return MOV.FakeAnglesGhostFirstPersonHide ~= false end,
             set = function(v) MOV.FakeAnglesGhostFirstPersonHide = v end,
             Desc = "off = ghost stays visible even in first person" })
+        -- FIX v20 [BUG#4]: колбэки теперь перекрашивают ЖИВОЙ гост.
+        -- Раньше писали только в MOV, а цвет применялся один раз в
+        -- buildFakeGhost → выбранный цвет появлялся лишь после респавна или
+        -- Show Ghost off→on. Отсюда «цвет FakeAngles не тот, что в UI».
+        local function faRestyle()
+            local fn = State.movRestyleFakeGhost
+            if type(fn) == "function" then pcall(fn) end
+        end
         K.color(FA, { Name = "Ghost Color", Flag = "FAGhostCol",
             Default = MOV.FakeAnglesGhostColor,
-            Callback = function(c) MOV.FakeAnglesGhostColor = c end })
+            Callback = function(c) MOV.FakeAnglesGhostColor = c; faRestyle() end,
+            Desc = "body tint of the ghost clone\napplies instantly" })
+        K.color(FA, { Name = "Ghost Outline", Flag = "FAGhostOut",
+            Default = MOV.FakeAnglesGhostOutline or Color3.fromRGB(180, 235, 255),
+            Callback = function(c) MOV.FakeAnglesGhostOutline = c; faRestyle() end,
+            Desc = "silhouette edge color" })
         K.slider(FA, { Name = "Ghost Transparency", Flag = "FAGhostTr",
             Default = math.floor((MOV.FakeAnglesGhostTransparency or 0.5) * 100),
             Min = 0, Max = 100, Suffix = "%",
-            Callback = function(v) MOV.FakeAnglesGhostTransparency = v / 100 end })
+            Callback = function(v)
+                MOV.FakeAnglesGhostTransparency = v / 100
+                faRestyle()
+            end })
 
         -- ═══ DEBUG ═════════════════════════════════════════════════════
         if dtab then
@@ -2998,6 +3083,18 @@ return function(Lib)
 
         K.ready()
     end
+
+    -- FIX v20 [C1]: guard от повторной инжекции — прошлый инстанс держал свои
+    -- Heartbeat/RenderStepped/LEAN_BIND и хуки сети, и тикал параллельно новому.
+    do
+        local g = (type(getgenv) == "function" and getgenv()) or _G
+        local prev = g.BRM5_MOV_MODULE
+        if type(prev) == "table" and type(prev.stop) == "function" and prev ~= _M then
+            pcall(prev.stop)
+        end
+        g.BRM5_MOV_MODULE = _M
+    end
+    if Bridge.registerModule then Bridge.registerModule("movement", _M) end
 
     return _M
 end
