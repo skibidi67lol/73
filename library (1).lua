@@ -1428,7 +1428,20 @@ function Bridge.isLocalPlayerAlive()
 			State.localPlayerAlive = false
 			return false
 		end
-		-- Локальный Humanoid — источник истины; replicate-флаги актора часто stale после respawn.
+		-- FIX v24 [РЕГРЕСС ОТ v22]: раньше здесь стояло «локальный Humanoid —
+		-- источник истины» и возврат true БЕЗУСЛОВНО. Но Humanoid-зеркало
+		-- «оживает» РАНЬШЕ, чем Flux-актор отдаёт живой CFrame (по дампу
+		-- ActorClass.Update пишет CFrame только живым, строка 3005, а новый
+		-- актор создаётся с CFrame = спавн-точка). В это окно два оракула
+		-- живости расходились: библиотечный уже «жив», killaura ещё «мёртв» —
+		-- и KillAura успевала отправить Impact с origin на трупе, что и давало
+		-- «после смерти кидает туда-сюда». Пока Flux ЯВНО говорит Alive==false,
+		-- верим ему, а не Humanoid.
+		local fx = fluxAliveState()
+		if fx == false then
+			State.localPlayerAlive = false
+			return false
+		end
 		if State.localPlayerAlive == false then
 			State.localPlayerAlive = true
 		end
