@@ -167,8 +167,15 @@ local KA_CONFIG = {
     -- ── Модификации ближнего боя (только клиент — пакеты не меняются) ───────
     -- Применяются к AnimationTrack и клиентскому _distance оружия после экипировки.
     -- Сервер получает стандартные пакеты без учёта этих значений.
-    MeleeAnimSpeed  = 2,   -- множитель скорости анимации удара (1.0 = норма)
-    MeleeReachBoost = 5.0,   -- +studs к клиентскому _distance (client force-hit; 0 = выкл)
+    -- v14.1 [BUG#3]: было 2 — ускоряло в т.ч. трек _slashTP (slash-with-
+    -- displacement, у него root-motion/лунж): персонажа рывком тащило вперёд на
+    -- каждом свинге, а с автосвингом каждые 0.35s это читалось как «толкает».
+    -- Теперь 1.0 по умолчанию, а _slashTP исключён из мода скорости совсем.
+    MeleeAnimSpeed  = 1,   -- множитель скорости анимации удара (1.0 = норма)
+    -- v14.1 [BUG#3]: было 5.0 — +5 studs к РЕАЛЬНОМУ клиентскому _distance
+    -- удлиняло луч, которым игра кастует удар, за серверный допуск и добавляло
+    -- к reposition-ам. Клампится в getKaReach, но по умолчанию выключаем.
+    MeleeReachBoost = 0,   -- +studs к клиентскому _distance (client force-hit; 0 = выкл)
     -- ── Скорость удара (Modify) — ТОЛЬКО для РУЧНЫХ ударов игрока ────────────
     -- Раньше «Modify» менял лишь скорость анимации (визуал), а не темп свингов.
     -- Теперь модифицируется _timer оружия (интервал между свингами в _use-цикле)
@@ -900,12 +907,31 @@ end
 -- v5: weapon-cfg независимые тайминги — всё из CONFIG.
 -- reach: если KillAuraReach не задан — берём НАСТОЯЩИЙ weapon._distance
 -- (без искусственного обхода), fallback 8.
+-- v14.1 [BUG#3] КЛАМП REACH — причина «меня что-то отталкивает при ноже».
+-- Сырой KillAuraReach=999 давал вектор Impact длиной 999 studs. Сервер
+-- валидирует мили-удар по позиции/фейсингу атакующего: попадание в голову за
+-- 999 studs геометрически невозможно → античит отклонял удар и ОТКАТЫВАЛ
+-- позицию игрока к последней валидной (rubberband). Тот же механизм описан в
+-- movement.lua:142 для спуфа прицела — на мили он срабатывает так же.
+-- Клампим к реальному _distance оружия × коэффициент: force-hit сохраняется,
+-- но геометрия остаётся правдоподобной и сервер её принимает.
+local KA_REACH_MULT = 1.6   -- запас над честным reach (наклон/предикт), не «телепорт»
 local function getKaReach()
-    local r = CONFIG.KillAuraReach
-    if type(r) == "number" and r > 0 then return r end
     local svc = State.kaMeleeSvc
-    local d = svc and rawget(svc, "_distance")
-    return (type(d) == "number" and d > 0) and d or 8
+    -- честный reach: оригинал из kaDistOrig (до MeleeReachBoost), иначе текущее поле
+    local base
+    if svc and State.kaDistOrig and type(State.kaDistOrig[svc]) == "number" then
+        base = State.kaDistOrig[svc]
+    else
+        base = svc and rawget(svc, "_distance")
+    end
+    if type(base) ~= "number" or base <= 0 then base = 8 end
+    local cap = base * KA_REACH_MULT
+    local r = CONFIG.KillAuraReach
+    if type(r) == "number" and r > 0 then
+        return math.min(r, cap)
+    end
+    return cap
 end
 
 local function getKaTimings()
@@ -937,12 +963,21 @@ local function applyMeleeMods(svc)
     local reachBoost = CONFIG.MeleeReachBoost or 0
 
     -- Скорость анимации удара (применяем всегда: 1.0 = вернуть норму после слайдера)
+    -- v14.1 [BUG#3]: _slashTP ИСКЛЮЧЁН из списка. Это slash-with-displacement
+    -- трек (TP = teleport/step), у него есть root-motion: AdjustSpeed(2) вдвое
+    -- ускоряло лунж и персонажа рывком тащило вперёд на каждом свинге. С
+    -- автосвингом раз в 0.35s это ощущалось как постоянный толчок при ноже.
+    -- Трек всё равно возвращаем к 1.0 на случай, что его уже разогнали ранее.
     if type(animSpeed) == "number" and animSpeed > 0 then
-        for _, field in ipairs({"_slash", "_slashTP", "_equip", "_idle"}) do
+        for _, field in ipairs({"_slash", "_equip", "_idle"}) do
             local track = rawget(svc, field)
             if track and type(track.AdjustSpeed) == "function" then
                 pcall(track.AdjustSpeed, track, animSpeed)
             end
+        end
+        local tp = rawget(svc, "_slashTP")
+        if tp and type(tp.AdjustSpeed) == "function" then
+            pcall(tp.AdjustSpeed, tp, 1)
         end
     end
 
@@ -2191,6 +2226,7 @@ end
 -- v14: тело per-frame viz-кадра. Именованная функция (без аллокации замыкания
 -- в кадре); зовётся из Heartbeat под pcall — throw больше не молчит.
 local kaVizErrWarnT = 0
+local kaTickErrWarnT = 0   -- v14.1 [M1]: троттл warn'а для главного тика
 local function kaVizFrame()
     -- [FIX] Валидируем что equipped не изменился с момента последнего ctx.
     -- resolveMeleeContext кэшируется по kaCtxEq — если _equipped сменился,
@@ -2265,7 +2301,9 @@ function _M.start()
     for k, v in pairs(KA_CONFIG) do
         if CONFIG[k] == nil then CONFIG[k] = v end
     end
-    State.running = true
+    -- v14.1 [H2]: через refcount (общий флаг иначе никто не опускает).
+    if Bridge.markModuleRunning then Bridge.markModuleRunning("killaura", true)
+    else State.running = true end
     pcall(function()
         if type(shared) == "table" and type(shared.import) == "function" then
             local ok, net = pcall(shared.import, "network")
@@ -2318,7 +2356,14 @@ function _M.start()
         acc = acc + dt
         if acc < (CONFIG.KillAuraTickInterval or 0.2) then return end
         acc = 0
-        pcall(tick)
+        -- v14.1 [M1]: был голый pcall(tick) — ошибка выбрасывалась молча.
+        -- Если тик начинал падать (апдейт игры, nil-поле), KillAura просто
+        -- «ничего не делала», без единого следа в консоли. Warn с троттлом 3с.
+        local ok, err = pcall(tick)
+        if not ok and now() - kaTickErrWarnT > 3 then
+            kaTickErrWarnT = now()
+            warn("[KA] tick упал:", tostring(err))
+        end
     end))
     -- FIX: было RenderStepped — он идёт ДО апдейта камеры, поэтому кольцо
     -- отставало на кадр и «ползло» при шифтлоке/резком повороте. Heartbeat
@@ -2367,6 +2412,8 @@ local function kaRestoreSvcMods(svc)
 end
 
 function _M.stop()
+    -- v14.1 [H2]: снимаем ссылку в общем refcount (см. markModuleRunning).
+    if Bridge.markModuleRunning then Bridge.markModuleRunning("killaura", false) end
     if kaConn     then kaConn:Disconnect()     kaConn     = nil end
     if kaVizConn  then kaVizConn:Disconnect()  kaVizConn  = nil end
     if kaInputConn then kaInputConn:Disconnect() kaInputConn = nil end
@@ -2652,7 +2699,19 @@ function _M.buildUI(ui)
     K.ready()   -- со следующего кадра уведомления разрешены
 end
 
+-- v14.1 [C1]: guard от повторной инжекции — прошлый инстанс держал свои
+-- kaConn/kaViz/хуки Impact и продолжал тикать параллельно с новым.
+do
+    local g = (type(getgenv) == "function" and getgenv()) or _G
+    local prev = g.BRM5_KA_MODULE
+    if type(prev) == "table" and type(prev.stop) == "function" and prev ~= _M then
+        pcall(prev.stop)
+    end
+    g.BRM5_KA_MODULE = _M
+end
+
 _M.Bridge            = Bridge
+if Bridge.registerModule then Bridge.registerModule("killaura", _M) end
 Bridge._killAuraModule = _M
 return _M
 end
