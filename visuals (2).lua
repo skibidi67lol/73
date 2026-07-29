@@ -1534,22 +1534,74 @@ return function(Lib)
     end
 
     -- Цель для контестируемого свойства; nil = сейчас не наше, не трогаем.
+    --
+    -- FIX v6: НАЙДЕН ВТОРОЙ ПИСАТЕЛЬ — Flux/Services/PostProcessingService.
+    -- Его Update (строка 59 дампа) тоже идёт каждый кадр и пишет:
+    --   L53   Lighting.Ambient              = not RGE and p4.Ambient or Color3.new()
+    --   L217  Lighting.Brightness           = v21   (сумма вкладов _brightness)
+    --   L237  Lighting.ExposureCompensation = v22   (сумма вкладов _exposures)
+    -- В v5 я считал эти три «неконтестируемыми» (в EnvironmentService их нет) —
+    -- поэтому Fullbright продолжал мелькать (он живёт ровно на Ambient +
+    -- Brightness), а у Atmosphere мелькали Shadow Tint, Brightness и Exposure.
     local function contestedTarget(prop)
-        if not V.AmbientEnabled then return nil end
+        local amb = V.AmbientEnabled
+        local fb  = V.FullbrightEnabled
+
+        if prop == "Ambient" then
+            -- Fullbright работает и БЕЗ Atmosphere — это его основное свойство.
+            if fb then
+                if amb then return liftToFullbright(V.AmbientColor) end
+                return FULLBRIGHT_COL
+            end
+            if amb then return V.AmbientColor end
+            return nil
+
+        elseif prop == "OutdoorAmbient" then
+            -- как и Ambient: Fullbright им владеет даже без Atmosphere
+            if fb then
+                if amb then return liftToFullbright(V.AmbientOutdoorColor) end
+                return FULLBRIGHT_COL
+            end
+            if amb then return V.AmbientOutdoorColor end
+            return nil
+
+        elseif prop == "Brightness" then
+            -- ВАЖНО: раньше Fullbright писал math.max(Lighting.Brightness, 2) —
+            -- ЧТЕНИЕ живого свойства. PostProcessingService перезаписывает его
+            -- каждый кадр, поэтому результат зависел от того, кто отработал
+            -- последним → значение прыгало само по себе. Считаем ТОЛЬКО из
+            -- своего конфига и сохранённого оригинала — стабильно между кадрами.
+            local base
+            if amb then base = V.AmbientBrightness end
+            if type(base) ~= "number" then
+                base = (lightSavedOK and type(lightSaved.Brightness) == "number")
+                       and lightSaved.Brightness or 2
+            end
+            if fb then return math.max(base, 2) end
+            if amb then return base end
+            return nil
+
+        elseif prop == "ExposureCompensation" then
+            if amb then return V.AmbientExposure or 0 end
+            return nil
+        end
+
+        -- дальше — только атмосферные, вне Atmosphere не наши
+        if not amb then return nil end
         if prop == "GeographicLatitude" then
             return V.AmbientLatitude or 45
         elseif prop == "ColorShift_Top" then
             return V.AmbientTintTop
-        elseif prop == "OutdoorAmbient" then
-            if V.FullbrightEnabled then
-                return liftToFullbright(V.AmbientOutdoorColor)
-            end
-            return V.AmbientOutdoorColor
         end
         return nil
     end
 
-    local CONTESTED = { "GeographicLatitude", "ColorShift_Top", "OutdoorAmbient" }
+    local CONTESTED = {
+        -- EnvironmentService.Update
+        "GeographicLatitude", "ColorShift_Top", "OutdoorAmbient",
+        -- PostProcessingService.Update  (FIX v6 — причина мелькания Fullbright)
+        "Ambient", "Brightness", "ExposureCompensation",
+    }
 
     local function reassertLightProp(prop)
         if _lightWriting then return end
@@ -1752,9 +1804,12 @@ return function(Lib)
             if type(laL) == "table" and rawget(laL, "Alive") == false then return end
         end
         saveLighting()
-        -- FIX v5 [МЕЛЬКАНИЕ]: сигналы на контестируемые свойства ставим ровно
-        -- один раз, как только атмосфера включена (idempotent).
-        if amb then
+        -- FIX v5/v6 [МЕЛЬКАНИЕ]: сигналы на контестируемые свойства ставим ровно
+        -- один раз (idempotent). Гейт `amb or fb`, а не только `amb`:
+        -- Fullbright живёт на Ambient + Brightness, которые перезаписывает
+        -- PostProcessingService каждый кадр — при одном включённом Fullbright
+        -- (без Atmosphere) сигналы раньше вообще не ставились, и он мелькал.
+        if amb or fb then
             hookLightingSignals()
         end
         if amb then
@@ -1777,13 +1832,21 @@ return function(Lib)
         -- экспозиция, туман). Раньше тут было только время + яркость.
         if amb then
             pcall(function()
-                Lighting.Brightness = V.AmbientBrightness
-                Lighting.Ambient        = V.AmbientColor
-                Lighting.OutdoorAmbient = V.AmbientOutdoorColor
-                Lighting.ColorShift_Top    = V.AmbientTintTop
+                -- FIX v6: контестируемые свойства пишем ИСКЛЮЧИТЕЛЬНО через
+                -- contestedTarget — тот же источник истины, что у re-assert по
+                -- сигналу. Иначе 4 Гц проход и сигнал считали бы «правильное»
+                -- значение независимо и дёргали свойство между двумя разными
+                -- корректными числами (особенно Brightness при Fullbright).
+                for _, p in ipairs(CONTESTED) do
+                    local want = contestedTarget(p)
+                    if want ~= nil and Lighting[p] ~= want then
+                        Lighting[p] = want
+                    end
+                end
+                -- НЕконтестируемые (игра их не пишет ни в одном сервисе):
+                -- GeographicLatitude отсюда УБРАН — он в CONTESTED (дубль писал
+                -- бы то же значение вторым путём, мимо единого источника истины).
                 Lighting.ColorShift_Bottom = V.AmbientTintBottom
-                Lighting.ExposureCompensation = V.AmbientExposure or 0
-                Lighting.GeographicLatitude   = V.AmbientLatitude or 45
                 Lighting.EnvironmentDiffuseScale  = V.AmbientDiffuse  or 1
                 Lighting.EnvironmentSpecularScale = V.AmbientSpecular or 1
                 Lighting.GlobalShadows = V.AmbientShadows ~= false
@@ -1809,17 +1872,25 @@ return function(Lib)
         -- Раньше формула жила локально внутри этого pcall, и re-assert считал бы
         -- своё значение независимо → OutdoorAmbient дёргался бы между двумя
         -- разными «правильными» цветами.
+        -- FIX v6 [МЕЛЬКАНИЕ FULLBRIGHT]: тут стояло
+        --     Lighting.Brightness = math.max(Lighting.Brightness, 2)
+        -- то есть ЧТЕНИЕ живого свойства. А PostProcessingService.Update
+        -- (строка 217 дампа) перезаписывает Brightness КАЖДЫЙ кадр своей суммой
+        -- вкладов. Значит max() считался то от нашего значения, то от игрового —
+        -- яркость прыгала сама по себе, даже без Atmosphere. Плюс Ambient/
+        -- OutdoorAmbient писались тут в третий раз, независимо от 4 Гц прохода и
+        -- от re-assert. Теперь всё контестируемое идёт ОДНИМ путём через
+        -- contestedTarget, а Fullbright-специфичного осталось только отключение
+        -- теней (GlobalShadows игра не пишет — это единственное его «своё»).
         if fb then
             pcall(function()
-                Lighting.Brightness    = math.max(Lighting.Brightness, 2)
-                Lighting.GlobalShadows = false
-                if amb then
-                    Lighting.Ambient        = liftToFullbright(V.AmbientColor)
-                    Lighting.OutdoorAmbient = liftToFullbright(V.AmbientOutdoorColor)
-                else
-                    Lighting.Ambient        = FULLBRIGHT_COL
-                    Lighting.OutdoorAmbient = FULLBRIGHT_COL
+                for _, p in ipairs(CONTESTED) do
+                    local want = contestedTarget(p)
+                    if want ~= nil and Lighting[p] ~= want then
+                        Lighting[p] = want
+                    end
                 end
+                Lighting.GlobalShadows = false
             end)
         end
         if nofog then
