@@ -1112,6 +1112,15 @@ return function(Lib)
     end
 
     local _tpRestyeT = 0
+    -- FIX v7 [SelfSkin]: форс немедленного перекраса тела из UI-колбэков.
+    -- styleSelfBody затроттлен (смена персонажа ИЛИ раз в 3с), поэтому смена
+    -- цвета/материала/прозрачности проявлялась с задержкой до 3 секунд и
+    -- выглядела как «не работает» — приходилось перезапускать фичу, что меняло
+    -- tpStyledChar и форсило перекрас. Обнуляем стамп → перекрас на следующем
+    -- же heartbeat (~16мс).
+    local function tpForceRestyle()
+        _tpRestyeT = 0
+    end
     local function thirdPersonStep()
         if not V.ThirdPersonEnabled then
             if tpStyledChar then restoreSelfBody() end
@@ -2384,16 +2393,60 @@ return function(Lib)
                 set = function(v) V.ThirdPersonEnabled = v end,
                 Desc = "recolors ur own body\nu see it in third person or spectate",
             })
+            -- ═══════════════════════════════════════════════════════════════
+            -- FIX v7 [SelfSkin: смена цвета не работает / highlight не меняется]
+            --
+            -- Было ДВЕ отдельные причины, и вместе они дают ровно тот симптом,
+            -- который описал пользователь.
+            --
+            -- 1) applySelfHighlight читает КАЖДЫЙ кадр три ключа:
+            --      V.ThirdPersonFill, V.ThirdPersonOutline,
+            --      V.ThirdPersonFillTransparency
+            --    — и НИ ОДНОГО из них не было в UI. Они навсегда оставались на
+            --    дефолтах (120,200,255 / 180,235,255 / 0.55). Пользователь менял
+            --    «Body Color», тело перекрашивалось, а highlight — нет. Отсюда
+            --    «меняется цвет кожи, а highlight нет».
+            --
+            -- 2) styleSelfBody вызывается не каждый кадр, а при смене персонажа
+            --    ИЛИ раз в 3 секунды (throttle _tpRestyeT). Поэтому даже цвет
+            --    тела появлялся с задержкой до 3с и это выглядело как «смена
+            --    цвета не работает» / «приходится перезапускать SelfSkin»
+            --    (перезапуск менял tpStyledChar и форсил перекрас немедленно).
+            --    Теперь колбэки форсят перекрас сами — применяется в тот же кадр.
+            -- ═══════════════════════════════════════════════════════════════
             K.color(S2, { Name = "Body Color", Flag = "TPColor",
                 Default = V.ThirdPersonBodyColor,
-                Callback = function(c) V.ThirdPersonBodyColor = c end })
+                Callback = function(c) V.ThirdPersonBodyColor = c; tpForceRestyle() end,
+                Desc = "color of ur own body parts" })
             K.slider(S2, { Name = "Transparency", Flag = "TPTransp",
                 Default = math.floor((V.ThirdPersonBodyTransparency or 0) * 100),
                 Min = 0, Max = 100, Suffix = "%",
-                Callback = function(v) V.ThirdPersonBodyTransparency = v / 100 end })
+                Callback = function(v)
+                    V.ThirdPersonBodyTransparency = v / 100
+                    tpForceRestyle()
+                end })
             K.dropdown(S2, { Name = "Material", Flag = "TPMat",
                 Options = MATERIALS, Default = matName(V.ThirdPersonMaterial),
-                Callback = function(n) V.ThirdPersonMaterial = matFromName(n) end })
+                Callback = function(n) V.ThirdPersonMaterial = matFromName(n); tpForceRestyle() end })
+
+            -- Контролы highlight — раньше их не существовало вовсе,
+            -- хотя код читал эти ключи каждый кадр.
+            K.group(S2, "Highlight")
+            K.color(S2, { Name = "Highlight Fill", Flag = "TPFill",
+                Default = V.ThirdPersonFill,
+                Callback = function(c) V.ThirdPersonFill = c end,
+                Desc = "silhouette fill — applies instantly" })
+            K.color(S2, { Name = "Highlight Outline", Flag = "TPOutline",
+                Default = V.ThirdPersonOutline,
+                Callback = function(c) V.ThirdPersonOutline = c end })
+            K.slider(S2, { Name = "Highlight Opacity", Flag = "TPFillTransp",
+                Default = math.floor((1 - (V.ThirdPersonFillTransparency or 0.55)) * 100),
+                Min = 0, Max = 100, Suffix = "%",
+                Callback = function(v)
+                    -- в UI — «плотность», в Roblox Highlight — прозрачность
+                    V.ThirdPersonFillTransparency = 1 - (v / 100)
+                end,
+                Desc = "0% = outline only" })
             K.toggle(S2, { Name = "Gradient", Flag = "TPGrad", Title = "TP Gradient",
                 get = function() return V.ThirdPersonGradientEnabled end,
                 set = function(v) V.ThirdPersonGradientEnabled = v end })
