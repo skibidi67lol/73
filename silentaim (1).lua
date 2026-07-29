@@ -1013,7 +1013,11 @@ local function ensureFovCircle()
 	c.Thickness   = CONFIG.FovCircleThickness or 1
 	c.Filled      = CONFIG.FovCircleFilled == true
 	c.Color       = CONFIG.FovCircleColor or Color3.fromRGB(255, 255, 255)
-	c.Transparency = CONFIG.FovCircleTransparency or 0.5
+	-- FIX v24 [L2]: тут писалась UI-семантика (0 = непрозрачный), а у Potassium
+	-- Drawing.Transparency — это АЛЬФА (1 = видно). Значение инвертировалось на
+	-- один кадр, пока per-frame путь (alpha = 1 - Transparency) не перезапишет.
+	-- Приводим к той же конвенции, что в showDrawing.
+	c.Transparency = 1 - (CONFIG.FovCircleTransparency or 0.5)
 	c.Visible     = false
 	c.ZIndex      = 10
 	State.fovCircle = c
@@ -1834,7 +1838,13 @@ function Bridge.hookFirearmInventory()
 			if State.inGetMuzzleHook then
 				return cf, hit, ray
 			end
-			if (CONFIG.SilentAim or mpActive())
+			-- FIX v24 [C2]: раньше гейт был только по CONFIG, поэтому хук после
+			-- stop() продолжал ретаргетить выстрелы И САМ набирал цель через
+			-- prepareCombatShotOnce (без aim-потока). Читаем живой State через
+			-- saState(), чтобы после переинжекта работал НОВЫЙ инстанс, а не
+			-- снапшот первой сессии (см. C1 в library v22).
+			local S = saState()
+			if S.saActive == true and (CONFIG.SilentAim or mpActive())
 				and typeof(cf) == "CFrame" then
 				State.inGetMuzzleHook = true
 				State.inShotPrep = true
@@ -2188,16 +2198,40 @@ Bridge.combatAimActive = function()
 	return active
 end
 
+-- FIX v24 [H1]: ЕДИНЫЙ список Drawing внутри State.aimViz.
+--
+-- Раньше списки на уничтожение были прописаны вразнобой в двух местах и оба
+-- неполные: ensureAimViz сносил {line,label,dot,crossH,crossV} + reticleLines +
+-- boxLines, а clearAimVisuals — только первые пять. Ни один не трогал
+-- muzzleLine/peekLine/clientLine/serverLine/debugText, которые создаются
+-- лениво через ensureLine/ensureText. Что эти ключи существуют — видно по
+-- hideAimViz, он их исправно гасит. Итог: до ~25 Drawing осиротевало на каждый
+-- цикл stop/start (невидимые, но ссылка потеряна — освободить уже нельзя), и
+-- число Drawing у экзекутора росло всю сессию. Это и есть «16 Drawing.new /
+-- 0 :Remove» из статистики по модулю.
+local AIMVIZ_SINGLE_KEYS = {
+	"crossH", "crossV", "dot", "line", "label",
+	"muzzleLine", "peekLine", "clientLine", "serverLine", "debugText",
+	"btCurrent", "btPast",
+}
+local AIMVIZ_LIST_KEYS = { "reticleLines", "boxLines" }
+
+local function destroyAimVizObjects(av)
+	if type(av) ~= "table" then return end
+	for _, key in ipairs(AIMVIZ_SINGLE_KEYS) do
+		Bridge.destroyDrawing(av[key])
+		av[key] = nil
+	end
+	for _, key in ipairs(AIMVIZ_LIST_KEYS) do
+		Bridge.destroyDrawingList(av[key])
+		av[key] = nil
+	end
+end
+
 function Bridge.ensureAimViz()
 	if State.aimViz and State.aimViz.crossH then return State.aimViz end
 	if State.aimViz then
-		local av = State.aimViz
-		for _, key in ipairs({ "line", "label", "dot", "crossH", "crossV" }) do
-			Bridge.destroyDrawing(av[key])
-			av[key] = nil
-		end
-		Bridge.destroyDrawingList(av.reticleLines)
-		Bridge.destroyDrawingList(av.boxLines)
+		destroyAimVizObjects(State.aimViz)
 		State.aimViz = nil
 	end
 	if not Drawing then return nil end
@@ -3361,8 +3395,13 @@ function Bridge.installNamecallHooks()
 
 	-- Post-hook Drawing API sanity test: if this vanishes together with ESP, the hook (or something at install time) is killing Drawing.
 	-- If it stays visible while ESP/AimViz disappear, then hides are coming from code (see VIZ logs with VizDebug).
+	--
+	-- FIX v24 [L1]: тест был БЕЗУСЛОВНЫМ — жёлтая надпись "HOOKTEST-v15"
+	-- вылезала в центре экрана на 8 секунд при КАЖДОЙ инжекции у всех
+	-- пользователей. Это диагностика, а не фича: гейтим по Debug-флагу.
 	pcall(function()
-		if Drawing and type(Drawing.new) == "function" then
+		if (CONFIG.ServerAimDebug == true or CONFIG.VizDebug == true)
+			and Drawing and type(Drawing.new) == "function" then
 			local t = Drawing.new("Text")
 			t.Text = "HOOKTEST-v15"
 			t.Size = 20
@@ -3680,15 +3719,10 @@ function Bridge.clearAimVisuals()
 		-- FIX: раньше здесь индексировался несуществующий локал `viz` — pcall
 		-- глотал ошибку на ПЕРВОЙ же строке, поэтому НИ ОДИН Drawing ниже
 		-- не удалялся. Теперь чистим строго через State.aimViz.
-		local av = State.aimViz
-		for _, key in ipairs({ "crossH", "crossV", "dot", "line", "label" }) do
-			Bridge.destroyDrawing(av[key])
-			av[key] = nil
-		end
-		if av.boxLines then
-			for _, l in ipairs(av.boxLines) do Bridge.destroyDrawing(l) end
-			av.boxLines = nil
-		end
+		-- FIX v24 [H1]: единый полный список (см. AIMVIZ_SINGLE_KEYS выше).
+		-- Здесь терялись reticleLines[1..20] + muzzleLine/peekLine/clientLine/
+		-- serverLine/debugText — ~25 Drawing на каждый stop/start.
+		destroyAimVizObjects(State.aimViz)
 		State.aimViz = nil
 	end
 end
@@ -4705,7 +4739,22 @@ local function startAimThread()
 			-- ножом трейсеры/маркеры не рисуем вообще
 			if Bridge.clearShotTracers then pcall(Bridge.clearShotTracers) end
 		end
+	end)
 
+	-- ═══════════════════════════════════════════════════════════════════════
+	-- FIX v24 [H3] Визуальный хвост тика вынесен в ОТДЕЛЬНЫЙ шаг.
+	--
+	-- Раньше весь кадр (12 шагов) шёл под ОДНИМ pcall. Детерминированный throw
+	-- в любом из шагов выше — refreshAimTarget / tickFullAutoAssist /
+	-- applyWeaponModify / installSilentAim / updateAimVisuals — пропускал ВСЁ,
+	-- что ниже: обслуживание FOV-круга и updateShotTracers. А updateShotTracers
+	-- — единственный путь затухания/истечения трейсеров, поэтому уже
+	-- нарисованные линии оставались Visible=true с последней альфой НАВСЕГДА
+	-- (плюс один [ERR]-принт в консоль каждый кадр, 60/сек, без троттла).
+	-- Ровно тот же анти-паттерн visuals.lua уже лечил своим runStep.
+	-- ═══════════════════════════════════════════════════════════════════════
+	local aimTickVisuals = LPH_NO_VIRTUALIZE(function(dt)
+		local t = os.clock()
 		-- FIX v11: FOV Circle — показывается только при наличии огнестрельного оружия И включённом SilentAim
 		do
 			local fc = State.fovCircle
@@ -4801,17 +4850,50 @@ local function startAimThread()
 			Bridge.updateShotTracers()
 		end
 	end)
+
+	-- FIX v24 [H3]: pcall на КАЖДЫЙ шаг + троттл warn'а (было — один [ERR]
+	-- принт на каждый кадр, 60/сек, потому что "ERR" обходит QuietLogs).
+	local _saStepWarnT = {}
+	local function saStep(name, fn, a)
+		local ok, err = pcall(fn, a)
+		if not ok then
+			local tw = os.clock()
+			if tw - (_saStepWarnT[name] or -999) >= 1 then
+				_saStepWarnT[name] = tw
+				warn("[SA] шаг", name, "упал:", tostring(err))
+			end
+		end
+	end
+
 	aimConn = game:GetService("RunService").Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
 		if not State.running then return end
-		local ok, err = pcall(aimTickBody, dt)
-		if not ok then
-			log("ERR", "SilentAim heartbeat", tostring(err))
-		end
+		saStep("logic",   aimTickBody,    dt)
+		-- визуал обслуживается ВСЕГДА, даже если логика упала: иначе трейсеры
+		-- застывали на экране, а FOV-круг перестаёт следить за FOV/вьюпортом.
+		saStep("visuals", aimTickVisuals, dt)
 	end))
 end
 
 local function stopAimThread()
 	if aimConn then aimConn:Disconnect(); aimConn = nil end
+	-- ═══════════════════════════════════════════════════════════════════
+	-- FIX v24 [C2] stop() теперь РЕАЛЬНО выключает SilentAim/ForceHit.
+	--
+	-- Хуки (muzzle/network/bulletSend/namecall) персистентны by design и живут
+	-- до рестарта игры, но гейтились ТОЛЬКО по CONFIG — ни один не смотрел на
+	-- лайфцикл. Плюс сам muzzle-хук самостоятельно набирал цель
+	-- (prepareCombatShotOnce) без aim-потока. Итог: после stop() при
+	-- включённом тоггле выстрелы продолжали ретаргетиться, а ForceHit —
+	-- синтезировать попадания, до перезахода в игру.
+	-- saActive читают Bridge.needsServerAimPatch / shouldForceClientHit
+	-- (library v22) и условие самого muzzle-хука.
+	State.saActive = false
+	-- FIX v24 [H2]: снимаем ссылку — гейты `if not State.running then break end`
+	-- в gm-stat поллере и ретрае установки хуков наконец РАБОТАЮТ.
+	if Bridge.markModuleRunning then Bridge.markModuleRunning("silentaim", false) end
+	-- restoreWeaponModify звался только из UI-тоггла — RPM/разброс/отдача
+	-- оставались промодифицированными после выгрузки модуля.
+	pcall(Bridge.restoreWeaponModify)
 	-- v23: раньше утекали — hitFx/bulletLog коннекты, драйвер и системы
 	-- частиц продолжали жить (и рисовать) после stop()
 	if State.hitFxConn then
@@ -4844,7 +4926,11 @@ end
 local SilentAim = {
 	start  = function()
 		brm5Global().State = State
-		State.running = true
+		-- FIX v24 [H2]: через refcount, иначе общий флаг некому опустить.
+		if Bridge.markModuleRunning then Bridge.markModuleRunning("silentaim", true)
+		else State.running = true end
+		-- FIX v24 [C2]: лайфцикл-флаг для персистентных хуков (см. stopAimThread).
+		State.saActive = true
 		-- FIX (хитсаунды кроме Default не работали, и не только они): здесь
 		-- SA_CONFIG заливался в CONFIG БЕЗУСЛОВНО. Дефолты уже применены при
 		-- загрузке модуля (строка ~247), а этот повторный проход при каждом
@@ -5380,6 +5466,21 @@ function SilentAim.buildUI(ui)
 
 	K.ready()
 end
+
+-- FIX v24 [C1/L5]: guard от повторной инжекции + от двойного start().
+-- Прошлый инстанс держал свой aimConn/hitFx/particle-драйвер и тикал
+-- параллельно новому (двойной filtergc, двойной набор цели).
+do
+	local g = (type(getgenv) == "function" and getgenv()) or _G
+	local prev = g.BRM5_SA_MODULE
+	if type(prev) == "table" and type(prev.stop) == "function" and prev ~= SilentAim then
+		pcall(prev.stop)
+	end
+	g.BRM5_SA_MODULE = SilentAim
+end
+
+SilentAim.isRunning = function() return State.saActive == true end
+if Bridge.registerModule then Bridge.registerModule("silentaim", SilentAim) end
 
 return SilentAim
 end -- return function(Lib)
