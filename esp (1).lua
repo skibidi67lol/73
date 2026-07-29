@@ -499,7 +499,6 @@ function Bridge.hideEspEntry(entry, reason, detail)
 	-- набегало 2-4 тысячи бессмысленных записей в кадр.
 	-- Теперь флаг: скрыли один раз — больше не трогаем, пока не отрисуем.
 	if entry._hidden then return end
-	entry._hidden = true
 	Bridge.logVizHide("ESP", reason or "entry", detail)
 	if entry.boxLines then
 		for _, line in ipairs(entry.boxLines) do line.Visible = false end
@@ -527,6 +526,13 @@ function Bridge.hideEspEntry(entry, reason, detail)
 	-- обнуление заставляло бы аллоцировать её заново на каждом возврате
 	-- актора в кадр. Значения всё равно перезаписываются при отрисовке.
 	entry._boxRect = nil
+	-- FIX v14 [BUG#1]: флаг ставим ПОСЛЕДНИМ. Раньше он выставлялся ДО ~45
+	-- записей Visible=false: если любая из них падала (примитив инвалидирован
+	-- экзекутором), остаток пропускался, а _hidden уже стоял true — все
+	-- последующие hideEspEntry/hideAllEspDrawings отрезались ранним выходом
+	-- на строке 501. Entry навсегда застревала полу-видимой с прошлыми
+	-- координатами: ровно тот «застывший ESP», о котором репорт.
+	entry._hidden = true
 end
 
 function Bridge.ensureEspDrawing(uid)
@@ -1597,6 +1603,15 @@ function Bridge.destroyEspEntry(entry)
 	-- уничтожались. У Potassium уничтожение НЕ гарантирует снятие с рендера,
 	-- поэтому на экране оставались висеть «мёртвые» примитивы.
 	-- Сбрасываем флаг, чтобы гашение прошло гарантированно.
+	--
+	-- FIX v14 [BUG#1]: сброса флага НЕ ХВАТАЛО — за ним не следовало само
+	-- гашение, оно полагалось на вызывающего. А cleanupEspCache гасит ДО
+	-- destroyEspEntry, то есть застрявшая (полу-видимая) entry уничтожалась
+	-- будучи видимой → примитив без ссылок навсегда на экране. Теперь гасим
+	-- здесь же; плюс Bridge.destroyDrawing (library v22) прячет каждый
+	-- примитив перед деструктором — двойная страховка.
+	entry._hidden = false
+	pcall(Bridge.hideEspEntry, entry, "destroy")
 	entry._hidden = false
 	for _, key in ipairs(ESP_ENTRY_SINGLE) do
 		Bridge.destroyDrawing(entry[key])
@@ -1751,6 +1766,12 @@ end
 -- чтобы draw-цикл пропускал отдельные зомби которые вошли в кластер.
 local _zombieClusterCache = nil
 local _zombieClusterT = -999
+-- FIX v14 [BUG#1]: доступ к локальному кэшу для stop() — иначе снапшот
+-- ranked-строк (с data/model-ссылками) жил до следующего start().
+function Bridge._espResetClusterCache()
+	_zombieClusterCache = nil
+	_zombieClusterT = -999
+end
 function Bridge.buildZombieCluster(ranked, cam, now)
 	local ttl = 0.5  -- обновляем кластеры раз в 0.5s
 	if _zombieClusterCache and now - _zombieClusterT < ttl then
@@ -1877,7 +1898,15 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 	State.lastEspUpdate = now
 
 	local cam = workspace.CurrentCamera
-	if not cam then return end
+	if not cam then
+		-- FIX v14 [BUG#1]: камеры нет (respawn/телепорт/смена камеры) — рисовать
+		-- не по чему. Раньше был голый return ДО всех hide-путей: весь оверлей
+		-- застывал с прошлыми координатами на всё окно без камеры, и
+		-- cleanupEspCache это НЕ лечил (акторы ещё в State.actors, значит entry
+		-- не ретайрятся). Гасим кадр честно.
+		Bridge.hideAllEspDrawings("no_camera")
+		return
+	end
 	local camPos = cam.CFrame.Position
 	-- FIX v13 (perf): ViewportSize читался на КАЖДОГО актора в offscreen-чеке.
 	local vpSize = cam.ViewportSize
@@ -1891,7 +1920,19 @@ Bridge.updateESP = LPH_NO_VIRTUALIZE(function(dt)
 		for _ in pairs(State.actors) do real += 1 end
 		actorCount = real
 		State.trackedActorCount = real
-		if actorCount == 0 then return end   -- таблица реально пустая — тихий выход бе�� hideAll
+		if actorCount == 0 then
+			-- FIX v14 [BUG#1] ГЛАВНАЯ ПРИЧИНА ЗАСТЫВАНИЯ: здесь стоял голый
+			-- return. Когда State.actors пустеет (конец раунда, смена карты,
+			-- pruneStaleActors вычистил всех), updateESP выходил тут КАЖДЫЙ
+			-- кадр — а весь hide-механизм (row-level root_gone и свип
+			-- исчезнувших) живёт НИЖЕ. Ветка «акторов нет — гасим всё» в
+			-- блоке ranked была недостижимым мёртвым кодом, потому что
+			-- actorCount==0 всегда выходил раньше. Итог: боксы/скелеты/тексты
+			-- висели с прошлыми координатами 0-5 секунд, до gc-тика.
+			-- Повторные вызовы дешёвые: hideEspEntry no-op по флагу _hidden.
+			Bridge.hideAllEspDrawings("no_actors")
+			return
+		end
 	end
 
 	-- FIX v12: ranked-пересборка вынесена в defer чтобы НЕ блокировать draw-кадр.
@@ -2502,6 +2543,14 @@ _M.start = function()
 				espWasOn = false
 				Bridge.hideAllEspDrawings("esp_disabled")
 			end
+			-- FIX v14 [BUG#1]: хаускипинг не должен зависеть от тоггла. 5s-тик
+			-- стоял НИЖЕ этого гейта: пока ESP выключен (через конфиг/хоткей, без
+			-- stop()), записи ушедших акторов и espVisibleCache ждали 60s-рескана
+			-- вместо 5s — до ~45 скрытых Drawing на каждого ушедшего актора.
+			if t - tGc >= 5 then
+				tGc = t
+				Bridge.cleanupEspCache()
+			end
 			return
 		end
 		espWasOn = true
@@ -2529,6 +2578,10 @@ _M.stop = function()
 	-- заметный фриз при выключении. clearAllEspDrawings сразу подменяет
 	-- таблицу (кадр уже чистый), а уничтожает в task.defer.
 	Bridge.clearAllEspDrawings()
+	-- FIX v14 [BUG#1]: кэш кластеров зомби переживал stop() и держал снапшот
+	-- ranked-строк (вместе с data/model-ссылками) до следующего start().
+	State._espLiveClusters = nil
+	if Bridge._espResetClusterCache then pcall(Bridge._espResetClusterCache) end
 end
 
 _M.toggle = function()
@@ -2769,6 +2822,28 @@ function _M.buildUI(ui)
 	K.ready()
 end
 
+-- ════════════════════════════════════════════════════════════════════
+-- FIX v14 [BUG#1] Guard от повторной инжекции.
+--
+-- Раньше каждый re-execute создавал НОВЫЙ инстанс (свой State, свой Heartbeat,
+-- свои Drawing), а прошлый продолжал жить: его espConn тикал параллельно, а его
+-- Drawing-объекты были досягаемы только из старого State.drawings. Новый UI не
+-- мог их выключить — с экрана они не убирались никогда, и если старый Heartbeat
+-- потом умирал, примитивы навсегда оставались Visible=true с прошлыми
+-- координатами. Ровно тот «застывший ESP, который не очищается».
+--
+-- prev.stop замыкается на СТАРЫЕ espConn/State — отключает и уничтожает верно.
+-- ════════════════════════════════════════════════════════════════════
+do
+	local g = (type(getgenv) == "function" and getgenv()) or _G
+	local prev = g.BRM5_ESP_MODULE
+	if type(prev) == "table" and type(prev.stop) == "function" and prev ~= _M then
+		pcall(prev.stop)
+	end
+	g.BRM5_ESP_MODULE = _M
+end
+
+if Bridge.registerModule then Bridge.registerModule("esp", _M) end
 Bridge._espModule = _M
 return _M
 end
