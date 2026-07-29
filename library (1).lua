@@ -6850,19 +6850,79 @@ function Bridge.resolveMeleeKaForceHitPart()
 	return nil, nil
 end
 
-function Bridge.interceptMeleeKaRaycast(old, workspaceInst, origin, direction, params)
-	if not Bridge.shouldForceMeleeKaRaycast() then
-		return old(workspaceInst, origin, direction, params)
+-- ═════════════════════════════════════════════════════════════════════════
+-- FIX v25 [КРИТИЧНО — хук ломал ActorClass.Update и морозил CFrame актора]
+--
+-- Что было не так (подтверждено стеком из игры):
+--   interceptMeleeKaRaycast <- namecall-хук <- ActorClass._getMaterial(470)
+--   <- _doFootstep(488) <- ActorClass.Update(2743) <- ReplicatorService.Update
+--   <- ClientHandler <- PhysicsSolver.SubStepper.Step
+--   => "argument #1 expects a string, but Vector3 was passed"
+--
+-- 1) ГЕЙТ РАБОТАЛ НАОБОРОТ. Условие
+--        typeof(params) ~= "RaycastParams" and not isGameBulletRaycastParams(params)
+--    при НАСТОЯЩЕМ RaycastParams даёт false → мы НЕ делегировали, а подделывали
+--    хит. То есть перехватывался КАЖДЫЙ workspace:Raycast во время замаха.
+--    Под это попадал ActorClass._getMaterial — рейкаст ВНИЗ (0,-3.5,0) за
+--    материалом под ногами. Он получал часть тела врага вместо земли,
+--    _doFootstep падал, а он зовётся из ActorClass.Update ДО строки 3005
+--    (p294.CFrame = v418). CFrame актора замирал прямо во время удара —
+--    игрока «косоебит туда-сюда». Ни один из моих прошлых клампов этого не
+--    касался: я правил геометрию пакета, а ломался апдейт актора.
+--
+-- 2) НЕВЕРНАЯ СИГНАТУРА SPHERECAST. У него 4 аргумента:
+--        workspace:Spherecast(origin, radius, direction, params)
+--    а функция принимала (origin, direction, params). Аргументы съезжали
+--    (radius попадал в direction, direction в params), и при делегировании
+--    четвёртый терялся вовсе — отсюда и Vector3 там, где ждали другое.
+--
+-- Теперь: перехватываем ТОЛЬКО рейкаст самого мили-репликатора, опознанный по
+-- идентичности его RaycastParams (killaura публикует State.kaMeleeRayParams,
+-- дамп MeleeInventoryReplicator строки 30/128). Не опознали — не трогаем.
+-- Сигнатура — varargs, аргументы игры не теряются никогда.
+-- ═════════════════════════════════════════════════════════════════════════
+function Bridge.interceptMeleeKaRaycast(old, workspaceInst, a1, a2, a3, a4)
+	-- Spherecast: (origin, radius, direction, params) — 4 аргумента.
+	-- Raycast:    (origin, direction, params)         — 3.
+	-- Раньше сигнатура была жёстко 3-аргументной, поэтому у Spherecast radius
+	-- попадал в direction, direction в params, а params терялся при делегировании.
+	local isSphere = type(a2) == "number"
+	local origin    = a1
+	local direction = isSphere and a3 or a2
+	local params    = isSphere and a4 or a3
+
+	-- Делегирование с ТОЧНОЙ арностью — ни один аргумент игры не теряется и
+	-- лишний nil не добавляется.
+	local function passthrough()
+		if isSphere then
+			return old(workspaceInst, a1, a2, a3, a4)
+		end
+		return old(workspaceInst, a1, a2, a3)
 	end
-	if typeof(params) ~= "RaycastParams" and not Bridge.isGameBulletRaycastParams(params) then
-		return old(workspaceInst, origin, direction, params)
+
+	if not Bridge.shouldForceMeleeKaRaycast() then
+		return passthrough()
+	end
+	-- Единственный надёжный признак «это удар мили»: тот самый объект
+	-- RaycastParams, который держит мили-репликатор.
+	local meleeParams = State.kaMeleeRayParams
+	if typeof(meleeParams) ~= "RaycastParams" or params ~= meleeParams then
+		return passthrough()
+	end
+	-- Страховка: рейкаст шагов направлен строго ВНИЗ и короткий. Даже если
+	-- params каким-то образом совпали, такой луч мы не подделываем.
+	if typeof(direction) == "Vector3" then
+		local m = direction.Magnitude
+		if m > 0.01 and direction.Y < 0 and math.abs(direction.Y) > m * 0.98 then
+			return passthrough()
+		end
 	end
 	local part, hitPos = Bridge.resolveMeleeKaForceHitPart()
 	if typeof(hitPos) ~= "Vector3" or typeof(origin) ~= "Vector3" then
-		return old(workspaceInst, origin, direction, params)
+		return passthrough()
 	end
 	if not part then
-		return old(workspaceInst, origin, direction, params)
+		return passthrough()
 	end
 	local dist = typeof(direction) == "Vector3" and direction.Magnitude or 0
 	local along = (hitPos - origin).Magnitude
@@ -6873,7 +6933,7 @@ function Bridge.interceptMeleeKaRaycast(old, workspaceInst, origin, direction, p
 	-- (rubberband, «меня что-то отталкивает» при ноже). Луч короче цели —
 	-- отдаём честный результат игры.
 	if dist > 0.05 and along > dist then
-		return old(workspaceInst, origin, direction, params)
+		return passthrough()
 	end
 	local normal = origin - hitPos
 	if normal.Magnitude < 0.01 then
