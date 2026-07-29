@@ -953,6 +953,11 @@ local function packetImpactReach()
         base = rawget(svc, "_distance")
     end
     if type(base) ~= "number" or base <= 0 then base = 5 end
+    -- v16: страховка. kaDistOrig — weak-таблица: после респавна запись про
+    -- оригинал может исчезнуть, пока kaMeleeSvc ещё указывает на svc с уже
+    -- раздутым _distance. По дампу максимальный Reach мили-оружия = 7 —
+    -- всё выше означает «поле уже промодифицировано», такому не верим.
+    if base > 7 then base = 7 end
     return base + KA_PACKET_REACH_MARGIN
 end
 
@@ -1060,15 +1065,46 @@ end
 
 -- origin атакующего = actor.CFrame:PointToWorldSpace(0,2.5,0) (как считает игра),
 -- fallback — позиция камеры.
+-- ══════════════════════════════════════════════════════════════════
+-- v16 [ПОСЛЕ СМЕРТИ КИДАЕТ ТУДА-СЮДА] — origin больше не берётся на веру.
+--
+-- Разбор дампа. ActorClass.Update (строка 1996) при смерти выходит РАНЬШЕ
+-- записи CFrame:
+--     if not p294.Alive then ... return end        -- каждый кадр
+--     ...
+--     p294.CFrame = v418                          -- строка 3005, только живым
+-- То есть у мёртвого актора CFrame ЗАМОРОЖЕН на позиции трупа. А Died()
+-- (строка 1886) сносит RootPart и обнуляет _equipped. Респавн создаёт НОВЫЙ
+-- объект актора (ReplicatorService.RegisterActor, строка 114) с
+-- CFrame = CFrame.new(spawnPos).
+--
+-- Фолбэк на камеру тоже врал: на экране смерти активна DeadCamera, а она
+-- припаркована на трупе (DeadCamera строка 44).
+--
+-- Итог: кламп Impact (v15) добросовестно проецировал точку удара на сферу
+-- вокруг НЕВЕРНОГО origin — то есть сам изготавливал невалидный пакет, но
+-- только после смерти. Сервер откатывал позицию, а CharacterController.Update
+-- (строка 1165) лерпит к _forceCFrame со скоростью dt*5 — то есть плавно.
+-- Следующий тик KillAura (0.2с) считал origin от УЖЕ СДВИНУТОГО актора и слал
+-- снова → петля: коррекция → пересчёт → снова пакет → коррекция. Именно
+-- «туда-сюда», а не одиночный толчок.
+--
+-- Теперь: origin отдаём только если актор ЖИВ и его CFrame согласован с
+-- SimulatedPosition. Иначе nil — и вызывающий ОБЯЗАН не слать пакет.
+-- ══════════════════════════════════════════════════════════════════
+local KA_ORIGIN_MAX_DRIFT = 8   -- studs расхождения CFrame vs SimulatedPosition
 local function kaImpactOrigin(actor)
-    if type(actor) == "table" then
-        local cf = rawget(actor, "CFrame")
-        if typeof(cf) == "CFrame" then
-            return cf:PointToWorldSpace(Vector3.new(0, 2.5, 0))
-        end
+    if type(actor) ~= "table" then return nil end
+    if rawget(actor, "Alive") ~= true then return nil end
+    local cf = rawget(actor, "CFrame")
+    if typeof(cf) ~= "CFrame" then return nil end
+    -- CFrame должен совпадать с живой позицией: иначе он застыл на трупе либо
+    -- ещё лерпит к серверной коррекции.
+    local sp = rawget(actor, "SimulatedPosition") or rawget(actor, "Position")
+    if typeof(sp) == "Vector3" and (cf.Position - sp).Magnitude >= KA_ORIGIN_MAX_DRIFT then
+        return nil
     end
-    local cam = Workspace.CurrentCamera
-    return cam and cam.CFrame.Position or Vector3.new()
+    return cf:PointToWorldSpace(Vector3.new(0, 2.5, 0))
 end
 
 -- Вектор направления для actor:Action-пути (LegitAuto+WallCheck). В этом пути
@@ -1081,7 +1117,11 @@ local function impactDir(actor, aimPart, reach)
     local cam  = Workspace.CurrentCamera
     local look = (cam and cam.CFrame.LookVector) or Vector3.new(0, 0, -1)
     if typeof(aimPoint) ~= "Vector3" then return look * reach end
-    local to  = aimPoint - kaImpactOrigin(actor)
+    -- v16: origin теперь может быть nil (мёртвый/несогласованный актор) —
+    -- без этой проверки была бы арифметика с nil. Падаем на взгляд камеры.
+    local origin = kaImpactOrigin(actor)
+    if typeof(origin) ~= "Vector3" then return look * reach end
+    local to  = aimPoint - origin
     local dir = (to.Magnitude > 0.05) and to.Unit or look
     return dir * reach
 end
@@ -1328,7 +1368,14 @@ local function triggerGameMeleeUse(svc, actor, ctx, aimPart, targetData)
             -- Клампим на сферу reach вокруг груди — как MeleeInventoryReplicator.
             do
                 local origin = kaImpactOrigin(actor)
-                if typeof(origin) == "Vector3" then
+                -- v16: origin неизвестен = актор мёртв либо его CFrame застыл на
+                -- трупе / лерпит к серверной коррекции. Слать пакет НЕЛЬЗЯ: он
+                -- будет невалиден, сервер откатит позицию, и получится петля
+                -- «коррекция → пересчёт origin → снова пакет» (кидает туда-сюда).
+                if typeof(origin) ~= "Vector3" then
+                    return
+                end
+                do
                     local pReach = packetImpactReach()
                     local to     = hitPos - origin
                     local along  = to.Magnitude
@@ -1614,7 +1661,12 @@ local function triggerPacketAutoFire(actor, aimPart, targetData)
     -- ═══════════════════════════════════════════════════════════════════
     do
         local origin = kaImpactOrigin(actor)
-        if typeof(origin) == "Vector3" then
+        -- v16: origin неизвестен = актор мёртв либо CFrame застыл на трупе /
+        -- лерпит к серверной коррекции. Пакет не шлём — иначе петля отката.
+        if typeof(origin) ~= "Vector3" then
+            return false, "no_origin"
+        end
+        do
             local reach = packetImpactReach()
             local to    = hitPos - origin
             local along = to.Magnitude
@@ -1657,6 +1709,20 @@ end
 local function performSwing(actor, ctx, aimPart, aimPoint, targetData, resetCd)
     if State.kaSwingBusy then return false, "busy" end
     if type(actor) ~= "table" then return false, "no_actor" end
+    -- ═══════════════════════════════════════════════════════════════════
+    -- v16 [ПОСЛЕ СМЕРТИ КИДАЕТ ТУДА-СЮДА]: строгий гейт по САМОМУ актору.
+    --
+    -- Раньше единственной проверкой живости был onLifeState() в тике, а он
+    -- использует killaura-оракул isLocalAlive(). Библиотечный оракул
+    -- Bridge.isLocalPlayerAlive устроен иначе (Humanoid-приоритет), и эти два
+    -- расходятся на окне смерть→респавн: один уже говорит «жив», второй ещё
+    -- «мёртв». В этом окне свинг проходил, а актор был мёртвый/новый со
+    -- спавн-CFrame — и пакет уходил с неверным origin.
+    -- Проверяем то, что реально важно, прямо на объекте: жив и есть что в руках
+    -- (Died() обнуляет _equipped — дамп ActorClass строка 1886).
+    -- ═══════════════════════════════════════════════════════════════════
+    if rawget(actor, "Alive") ~= true then return false, "actor_not_alive" end
+    if rawget(actor, "_equipped") == nil then return false, "no_equip" end
     if not kaHasValidAim(aimPart, aimPoint, targetData) then return false, "no_aim" end
     local _, cd = getKaTimings()
     if not resetCd and now() - (State.kaLastSwing or 0) < cd then return false, "cooldown" end
@@ -2265,7 +2331,20 @@ local function kaTickCombat(actor, ctx, autoSwing)
 
     if kaMode == "Hook" then
         -- Hook: нет авто-замаха. Поддерживаем активный стиринг Impact,
-        -- чтобы при ручном уд����ре игрока хук перенаправил Impact на це��ь KA.
+        -- чтобы при ручном ударе игрока хук перенаправил Impact на цель KA.
+        --
+        -- v16 [ПОСЛЕ СМЕРТИ КИДАЕТ ТУДА-СЮДА — путь Hook-режима]: стиринг
+        -- взводился безусловно, пока есть цель. Поэтому ручной удар на окне
+        -- смерть→респавн уходил через steeredImpact → impactDir →
+        -- kaImpactOrigin, то есть с origin на трупе. Именно так «любой режим»
+        -- попадал в ту же петлю, хотя Hook сам ничего не автострелит.
+        -- Снимаем стиринг, пока актор не жив.
+        if rawget(actor, "Alive") ~= true or rawget(actor, "_equipped") == nil then
+            State.kaImpactSteer = false
+            State.kaImpactPart  = nil
+            State.kaImpactUid   = nil
+            return
+        end
         pcall(ensureRepImpactHook, actor, ctx)
         State.kaImpactSteer = true
         State.kaImpactPart  = aimPart
