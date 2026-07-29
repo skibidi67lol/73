@@ -368,6 +368,15 @@ local State = {
 	tuneCache = {},
 	modifyBackup = {},
 	running = false,
+	-- FIX v22 [H2]: State.running выставлялся в true ТРЕМЯ модулями
+	-- (killaura/movement/silentaim) и не сбрасывался в false НИГДЕ во всём
+	-- наборе. Все «исправленные» зомби-поллеры, которые гейтятся по этому
+	-- флагу, продолжали жить после stop(): gm-stat поллер вечно гонял
+	-- collectFirearmComponents, 30×0.5s ретрай установки хуков крутился ещё
+	-- ~15с, respawn/equip-таски библиотеки тикали при полностью остановленных
+	-- модулях. Один модуль не может опустить общий флаг, не убив остальные —
+	-- поэтому считаем ссылки: см. Bridge.markModuleRunning.
+	runningRefs = {},
 	lastEspRescan = 0,
 	lastEspFullRescan = -1,  -- FIX: -1 = не инициализирован, обновится при старте
 	lastEspUpdate = 0,
@@ -1251,8 +1260,16 @@ local function installClientsHooks()
 	if type(getter) == "function" then
 		if type(hookfunction) == "function" then
 			-- Хук игрового резолвера клиента. Тело — нативным (LPH_NO_VIRTUALIZE).
-			hookfunction(getter, LPH_NO_VIRTUALIZE(function(self, player, ...)
-				local ret = getter(self, player, ...)
+			-- FIX v22 [H4]: возвращаемое значение hookfunction ИГНОРИРОВАЛОСЬ, а
+			-- внутри хука звался сам getter — но он уже перехвачен, значит вызов
+			-- уходил в этот же хук: бесконечная рекурсия / переполнение C-стека
+			-- при первом же резолве клиента. Функция сейчас нигде не вызывается
+			-- (мёртвый код), поэтому краша никто не видел — но любое включение
+			-- «как есть» ложило бы игру на входе. Конвенция набора — звать
+			-- ВОЗВРАЩЁННЫЙ ref (см. visuals.lua и silentaim.lua).
+			local ref
+			ref = hookfunction(getter, LPH_NO_VIRTUALIZE(function(self, player, ...)
+				local ret = (ref or getter)(self, player, ...)
 				if player == LP and type(ret) == "table" then
 					captureLocalClient(ret, "hook-GetClientFromPlayer")
 				end
@@ -1364,14 +1381,40 @@ local function resolveLocalPlayer()
 	end
 end
 
+-- FIX v22 [BUG#2/L-1]: Character*-события в BRM5 НЕ стреляют (подтверждено
+-- счётчиками watchdog в movement.lua), а Humanoid-зеркало после смерти может
+-- не «ожить» — respawn идёт через Flux-актора. Раньше единственные пути к
+-- localPlayerAlive=true висели на LP.CharacterAdded → один hum.Died латчил
+-- флаг в false ДО КОНЦА СЕССИИ, и всё, что за ним гейтится (weapon context,
+-- hand rediscover, schedulePostRespawnWeaponRediscover) умирало навсегда.
+-- Сверяемся с Flux-актором в «мёртвых» ветках.
+local function fluxAliveState()
+	local ok, actor = pcall(function()
+		local _, a = Bridge.resolveLocalActor(false)
+		return a
+	end)
+	if ok and type(actor) == "table" then
+		local alive = tableField(actor, "Alive")
+		if alive == true then return true end
+		if alive == false then return false end
+		local hp = tableField(actor, "Health")
+		if type(hp) == "number" then return hp > 0 end
+	end
+	return nil
+end
+
 function Bridge.isLocalPlayerAlive()
 	local char = LP and LP.Character
 	if not char or not char.Parent then
+		local fx = fluxAliveState()
+		if fx ~= nil then State.localPlayerAlive = fx; return fx end
 		return false
 	end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	if hum then
 		if hum.Health <= 0 then
+			local fx = fluxAliveState()
+			if fx ~= nil then State.localPlayerAlive = fx; return fx end
 			State.localPlayerAlive = false
 			return false
 		end
@@ -1382,6 +1425,8 @@ function Bridge.isLocalPlayerAlive()
 		return true
 	end
 	if State.localPlayerAlive == false then
+		local fx = fluxAliveState()
+		if fx ~= nil then State.localPlayerAlive = fx; return fx end
 		return false
 	end
 	return true
@@ -4175,13 +4220,24 @@ function Bridge.trackHandFromChange(item, equipped, mods)
 end
 
 function Bridge.hookOwnerChange(owner, mods)
+	if type(owner) ~= "table" then return end
+	-- FIX v22 [M4]: guard был на changeOriginals — таблица СЕССИОННАЯ (новая на
+	-- каждый лоад library), а обёртка живёт на игровом объекте, который
+	-- переинжект переживает. Повторный запуск враппил предыдущую обёртку —
+	-- слой на слой, каждый пинил старый инстанс. Метку держим на самом объекте.
+	if rawget(owner, "__brm5ChangeOrig") then
+		changeOriginals[owner] = rawget(owner, "__brm5ChangeOrig")
+		State.changeHookOwner = owner
+		return
+	end
 	if changeOriginals[owner] then return end
 	local changeFn = tableField(owner, "Change")
 	if type(changeFn) ~= "function" then return end
 
 	changeOriginals[owner] = changeFn
+	rawset(owner, "__brm5ChangeOrig", changeFn)
 	rawset(owner, "Change", function(self, item, equipped, ...)
-		local orig = changeOriginals[owner]
+		local orig = changeOriginals[owner] or rawget(owner, "__brm5ChangeOrig")
 		local ret = table.pack(orig(self, item, equipped, ...))
 		-- v19 PATCH: debounce — при rebuild инвентаря Change зовётся N раз подряд
 		-- каждый task.defer → N тяжёлых coroutines = FPS дроп.
@@ -4224,11 +4280,28 @@ function Bridge.hookSharedInventoryTable(si, mods)
 		return
 	end
 	State.sharedInventorySiRef = si  -- v19 PATCH: сохраняем ref для сброса при ресете
+
+	-- FIX v22 [C3]: обёртки НАСЛАИВАЛИСЬ по одной на каждый респавн.
+	-- resetAfterRespawn (silentaim) снимает __brm5Hooked, чтобы хуки
+	-- переустановились, но si — require-кэшированная таблица: повторный wrap
+	-- захватывал ПРЕДЫДУЩУЮ обёртку как orig. После N смертей каждый
+	-- PerformEquipCalls гонял N вложенных хендлеров (N× applyWeaponModify +
+	-- N× HUD refresh на каждый экип) — микрофризы, растущие всю сессию.
+	-- Теперь оригиналы лежат на самой таблице и снимаются перед пере-враппом.
+	local prevOrig = rawget(si, "__brm5Orig")
+	if type(prevOrig) == "table" then
+		for name, fn in pairs(prevOrig) do
+			if type(fn) == "function" then rawset(si, name, fn) end
+		end
+	end
 	rawset(si, "__brm5Hooked", true)
+	local origMap = {}
+	rawset(si, "__brm5Orig", origMap)
 
 	local function wrap(name, handler)
 		local orig = si[name]
 		if type(orig) ~= "function" then return end
+		origMap[name] = orig
 		si[name] = function(...)
 			handler(...)
 			return orig(...)
@@ -6050,15 +6123,19 @@ end
 --
 -- Почему он нужен: по докам Potassium деструктор — :Destroy(). По всей
 -- кодовой базе исторически звался :Remove(), всегда внутри pcall — то есть
--- если метода нет, ошибка молча глоталась и объект ТЕК. Здесь пробуем
--- Destroy, затем Remove, и только в самом конце прячем объект, чтобы
--- недобитый Drawing хотя бы не висел на экране.
+-- если метода нет, ошибка молча глоталась и объект ТЕК.
+--
+-- FIX v22: hide идёт ПЕРВЫМ и всегда. На Potassium успешный :Destroy() НЕ
+-- снимает примитив с рендера — уничтоженный, но видимый Drawing застывал на
+-- экране НАВСЕГДА: ссылок на него больше нет, Visible уже не перевернуть, а
+-- cleardrawcache() в наборе не зовётся нигде. Раньше hide стоял последним и
+-- выполнялся только если ОБА деструктора упали.
 -- ─────────────────────────────────────────────────────────────────────────
 function Bridge.destroyDrawing(obj)
 	if not obj then return false end
+	pcall(function() obj.Visible = false end)
 	if pcall(function() obj:Destroy() end) then return true end
 	if pcall(function() obj:Remove() end) then return true end
-	pcall(function() obj.Visible = false end)
 	return false
 end
 
@@ -6517,7 +6594,35 @@ function Bridge.redirectEnemyHitToAimBone(hitPos, part, originPos, bulletUid)
 	return newPos, bonePart, normal, true
 end
 
+-- ═════════════════════════════════════════════════════════════════════════
+-- FIX v22 [H2] Учёт запущенных модулей вместо одностороннего State.running.
+--
+-- State.running — ОБЩИЙ флаг: его читают library/killaura/movement/silentaim,
+-- поэтому ни один модуль не мог опустить его в stop(), не сломав остальные.
+-- В итоге его вообще никто не опускал, и все гейты `if not State.running then
+-- break end` были мёртвыми. Считаем ссылки: running = есть хотя бы один живой.
+-- ═════════════════════════════════════════════════════════════════════════
+function Bridge.markModuleRunning(name, on)
+	if type(name) ~= "string" then return end
+	State.runningRefs = State.runningRefs or {}
+	if on then
+		State.runningRefs[name] = true
+	else
+		State.runningRefs[name] = nil
+	end
+	local any = false
+	for _ in pairs(State.runningRefs) do any = true; break end
+	State.running = any
+end
+
+-- FIX v22 [C2]: добавлен лайфцикл-гейт State.saActive.
+-- Хуки silentaim (muzzle/network/bulletSend/namecall) персистентны by design —
+-- ставятся один раз и живут до рестарта игры. Но гейтились они ИСКЛЮЧИТЕЛЬНО по
+-- CONFIG, поэтому stop() их не выключал: выстрелы продолжали ретаргетиться, а
+-- ForceHit — синтезировать попадания, пока пользователь думал, что чит выгружен.
+-- saActive выставляется в start()/stop() самого silentaim.
 function Bridge.shouldForceClientHit()
+	if State.saActive ~= true then return false end
 	return CONFIG.ForceClientHit == true or CONFIG.ForceHit == true
 end
 
@@ -6720,6 +6825,15 @@ function Bridge.interceptMeleeKaRaycast(old, workspaceInst, origin, direction, p
 	end
 	local dist = typeof(direction) == "Vector3" and direction.Magnitude or 0
 	local along = (hitPos - origin).Magnitude
+	-- FIX v22 [BUG#3]: не рапортуем попадание ДАЛЬШЕ длины самого луча.
+	-- Раньше синтетический хит возвращался с Distance=min(along,dist), но сам
+	-- along мог быть далеко за пределами reach (KillAuraReach=999) — сервер
+	-- видел геометрически невозможный мили-удар и откатывал позицию игрока
+	-- (rubberband, «меня что-то отталкивает» при ноже). Луч короче цели —
+	-- отдаём честный результат игры.
+	if dist > 0.05 and along > dist then
+		return old(workspaceInst, origin, direction, params)
+	end
 	local normal = origin - hitPos
 	if normal.Magnitude < 0.01 then
 		normal = Vector3.new(0, 1, 0)
@@ -8822,7 +8936,9 @@ function Bridge.shouldSpoofMuzzlePosition()
 	return CONFIG.LiteMultiPoint == true
 end
 
+-- FIX v22 [C2]: лайфцикл-гейт — см. коммент у shouldForceClientHit.
 function Bridge.needsServerAimPatch()
+	if State.saActive ~= true then return false end
 	return CONFIG.SilentAim == true or mpActive()
 end
 
@@ -11152,6 +11268,58 @@ local BRM5Lib = {
 	Bridge  = Bridge,
 	CONFIG  = CONFIG,
 	State   = State,
-	version = "BRM5Lib_v21",
+	version = "BRM5Lib_v22",
 }
+
+-- ════════════════════════════════════════════════════════════════════
+-- FIX v22 [C1] Публикация ЖИВЫХ ссылок инстанса в getgenv().__BRM5
+--
+-- Проблема: персистентные хуки (silentaim: muzzle/network/bulletSend/namecall)
+-- ставятся ОДИН раз и живут до рестарта игры. Их тела читают CONFIG/State/
+-- Bridge как upvalue своего замыкания. Переинжект скрипта создавал новый
+-- CONFIG/State, но хуки продолжали обслуживать ПЕРВУЮ сессию — новый UI не мог
+-- ни выключить SilentAim, ни поменять FOV/кости: хук читал снапшот старого
+-- конфига. Раньше в __BRM5 клался только State, и то без перезаписи.
+--
+-- Теперь каждый лоад library перетирает ссылки, а хуки резолвят их динамически.
+-- ════════════════════════════════════════════════════════════════════
+do
+	local g = (type(getgenv) == "function" and getgenv()) or _G
+	g.__BRM5 = g.__BRM5 or {}
+	local G = g.__BRM5
+
+	-- Гасим прошлый инстанс: его коннекты/поллеры иначе тикают параллельно
+	-- с новым (двойной filtergc, двойной ESP, «выключенный» оверлей на экране).
+	if type(G.shutdownAll) == "function" then
+		pcall(G.shutdownAll)
+	end
+
+	G.Lib    = BRM5Lib
+	G.Bridge = Bridge
+	G.CONFIG = CONFIG
+	G.State  = State      -- перезаписываем безусловно (было: только если nil)
+
+	-- Реестр модулей текущего инстанса + общий teardown.
+	G.modules = {}
+	G.shutdownAll = function()
+		local mods = G.modules
+		if type(mods) ~= "table" then return end
+		for name, m in pairs(mods) do
+			if type(m) == "table" and type(m.stop) == "function" then
+				local ok, err = pcall(m.stop)
+				if not ok then warn("[BRM5] stop", name, "упал:", err) end
+			end
+		end
+		G.modules = {}
+	end
+
+	-- Модули регистрируются этим хелпером в своём start().
+	Bridge.registerModule = function(name, mod)
+		local gg = ((type(getgenv) == "function" and getgenv()) or _G).__BRM5
+		if type(gg) == "table" and type(gg.modules) == "table" then
+			gg.modules[name] = mod
+		end
+	end
+end
+
 return BRM5Lib
