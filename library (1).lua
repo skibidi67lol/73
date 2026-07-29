@@ -183,7 +183,17 @@ local CONFIG = {
 	LogAttributesOnce = false,
 	ReserveCacheSec = 5.0,
 	WeaponCtxCacheSec = 0.85,
-	WeaponCtxEmptyCacheSec = 8.0,
+	-- FIX v23: было 8.0 — и это делало НЕРАБОЧИМ уже написанный фикс на 0.4с.
+	-- В коде стоит `local emptyTtl = CONFIG.WeaponCtxEmptyCacheSec or 0.4` с
+	-- комментарием «Reduced to 0.4s so weapon switches register within one
+	-- heartbeat» — но ключ в CONFIG существовал, поэтому `or 0.4` никогда не
+	-- срабатывал и TTL оставался 8 секунд. Любая запись WEAPON_CTX_EMPTY (в т.ч.
+	-- легитимная, на середине свопа оружия) морозила ВСЕХ потребителей ctx —
+	-- combatAimActive, HUD, modify — на 8 секунд. Это и есть «часто багается»
+	-- вокруг переключений, отдельно от постоянного латча.
+	-- Спина не будет: у рединдексации есть бэкофф по промахам (2.5с при 2, 4.0с
+	-- при 4 — см. tickHandRediscoverIfNeeded).
+	WeaponCtxEmptyCacheSec = 0.4,
 	EspWeaponInfoTtl = 2.5,
 	HandRediscoverInterval = 0.45,  -- FIX v21: poll после respawn если ctx пуст
 	NoWeaponRediscoverInterval = 2.5,
@@ -4314,6 +4324,24 @@ function Bridge.hookSharedInventoryTable(si, mods)
 		wrap("PerformEquipCalls", function(itemA, itemB, owner)
 		Bridge.bindPlayerInventory(owner, "PerformEquipCalls", mods)
 		if type(itemA) == "table" and Bridge.isPlayerFirearmItem(itemA, mods) then
+			-- FIX v23 [SilentAim умирает при смене ствол↔нож]: PerformEquipCalls —
+			-- событие функциональной ЯЧЕЙКИ (лоадаут/ресаплай/respawn-sync), а не
+			-- «взял в руки». По дампу StorageLayout порядок ячеек
+			-- { Primary, Secondary, Melee, Vest, Belt, ... }, и InventoryService.Sync
+			-- зовёт PerformEquipCalls на каждую изменённую ячейку по очереди.
+			-- Одежда/гранаты не проходят isPlayerFirearmItem, поэтому ПОСЛЕДНИМ
+			-- успешным пином всегда оказывался НОЖ (Melee) — так пин и садился на
+			-- мили ещё до всякой смены оружия. Ставим пин только если предмет
+			-- реально экипирован (либо _equipped нечитаем — ранняя загрузка).
+			do
+				local _, actorA = Bridge.resolveLocalActor(false)
+				local liveEq = (type(actorA) == "table")
+					and Bridge.normalizeEquipUid(rawget(actorA, "_equipped")) or nil
+				local aUid = Bridge.itemUid(itemA)
+				if liveEq and aUid and liveEq ~= aUid then
+					return
+				end
+			end
 			State.handItem = itemA
 			State.noWeaponRediscoverMisses = 0
 			State.handSlot = Bridge.slotLabelFromItem(itemA, mods)
@@ -9095,12 +9123,19 @@ end
 function Bridge.isWeaponInHand(actor, hand, mods)
 	if type(hand) ~= "table" then return false end
 	mods = mods or Bridge.loadSharedModules()
+	local uid = Bridge.itemUid(hand)
+	local eq  = (type(actor) == "table")
+		and Bridge.normalizeEquipUid(rawget(actor, "_equipped")) or nil
+	-- FIX v23 [SilentAim умирает при смене ствол↔нож]: identity-байпас верил
+	-- State.handItem БЕЗУСЛОВНО и тем самым легитимизировал протухший пин —
+	-- вторая половина того же бага (см. getLiveWeaponContext). Теперь байпас
+	-- работает только если живой _equipped неизвестен ИЛИ совпадает.
 	if State.handItem == hand and (State.handHookTime or 0) > 0 then
-		return true
+		if not eq or not uid or uid == eq then
+			return true
+		end
 	end
 	if type(actor) ~= "table" then return false end
-	local uid = Bridge.itemUid(hand)
-	local eq = Bridge.normalizeEquipUid(rawget(actor, "_equipped"))
 	if uid and eq and uid == eq then
 		if Bridge.isMeleeItem(hand, mods) then
 			local handler = Bridge.getWeaponHandler(actor, eq)
@@ -9243,6 +9278,49 @@ Bridge.getLiveWeaponContext = function(force)
 	if State.handItem and Bridge.isPlayerFirearmItem(State.handItem, mods)
 		and (State.handHookTime or 0) > 0 then
 		hand, handSlot = State.handItem, State.handSlot
+		-- ═══════════════════════════════════════════════════════════════
+		-- FIX v23 [SilentAim умирает при смене ствол↔нож] — ГЛАВНЫЙ ФИКС.
+		--
+		-- Этот быстрый путь не имел НИ TTL, НИ сверки с живым состоянием: раз
+		-- State.handItem выставлен — ctx до конца жизни собирается по нему, а
+		-- resolveHandFromActor (единственный, кто читает реальный _equipped)
+		-- становится недостижим. Хуже: isPlayerFirearmItem принимает и мили
+		-- (^Melee тоже матчится), поэтому пин мог указывать на НОЖ.
+		--
+		-- Почему пин протухает: смена оружия В РУКАХ (клавиши 1/2/3) в этой игре
+		-- не проходит ни через PerformEquipCalls, ни через owner:Change — по
+		-- дампу InventoryService._sync (строки 400-435) она только зовёт
+		-- Handler:Equip(), пишет _localActor:State("Equip", UID) и шлёт
+		-- FireServer("InventoryEquip", uid). Ни одну из этих точек набор не
+		-- хукает. Значит корректировать пин было просто нечему.
+		--
+		-- А все сторожа рединдексации спрашивают «валиден ли ctx?», и
+		-- weaponContextValid для мили возвращает TRUE (строка 3709, это нужно
+		-- для HUD) — то есть застрявший нож считался здоровым состоянием и
+		-- ремонт не запускался никогда. Отсюда «SilentAim перестаёт работать
+		-- вовсе»: isFirearmAimContext → false → combatAimActive → false.
+		--
+		-- Сверяем пин с живым _equipped. Расхождение → сбрасываем, ниже
+		-- resolveHandFromActor отдаст то, что реально в руках.
+		-- ═══════════════════════════════════════════════════════════════
+		if actor then
+			local liveEq = Bridge.normalizeEquipUid(rawget(actor, "_equipped"))
+			if not liveEq then
+				local st = tableField(actor, "CurrentState")
+				if type(st) == "table" then
+					liveEq = Bridge.normalizeEquipUid(tableField(st, "Equip"))
+				end
+			end
+			local pinUid = Bridge.itemUid(hand)
+			-- liveEq == nil (ранняя загрузка / актор не резолвится) — пин НЕ трогаем
+			if liveEq and pinUid and liveEq ~= pinUid then
+				hand, handSlot = nil, nil
+				State.handItem     = nil
+				State.handSlot     = nil
+				State.handHookTime = 0
+				State.cachedHudHandUid = nil
+			end
+		end
 	end
 	if not hand and actor then
 		hand, handSlot, handlerHint = Bridge.resolveHandFromActor(actor, mods)
